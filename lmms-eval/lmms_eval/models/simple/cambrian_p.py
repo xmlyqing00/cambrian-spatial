@@ -66,6 +66,7 @@ from cambrianp.mm_utils import (
     tokenizer_image_token,
 )
 from cambrianp.model.builder import load_pretrained_model
+from cambrianp.model.multimodal_projector.vggt_token import load_vggt_tokens, vggt_feature_path
 
 
 # Determine best attention implementation
@@ -109,6 +110,15 @@ class CambrianP(lmms):
         camera_tokens_mode: Optional[str] = "camera_tokens",
         camera_tokens_place: Optional[str] = "prepend_to_frame",
         query_mode: Optional[str] = "query_after_question",
+        frame_index_file: Optional[str] = None,  # JSON {"<dir>/<video file>": [frame indices]} replacing uniform frame sampling
+        vggt_feat_dir: Optional[str] = None,  # precomputed VGGT-17 features (<dir>/<video dir>/<video stem>.npz); appends one VGGT token per frame
+        vggt_token_source: Optional[str] = "group",  # "group" (anchor of its 17-frame pass) or "scene" (one pass over all sampled frames)
+        vggt_token_stats: Optional[str] = None,  # npz with per-dim mean/std for an untrained projector; trained adapters carry their own
+        vggt_gather_mode: Optional[str] = None,  # inferred from a trained adapter; "lookat" requires scene geometry
+        vggt_gather_radius: Optional[float] = None,
+        vggt_gather_scope: Optional[str] = None,
+        vggt_gather_far_gap: Optional[int] = None,
+        lora_path: Optional[str] = None,  # train.py LoRA output dir; merged into the model after loading
         **kwargs,
     ) -> None:
         super().__init__()
@@ -150,6 +160,14 @@ class CambrianP(lmms):
         self.camera_tokens_place = camera_tokens_place
         self._force_safe_decord_paths = set()
         self._safe_decord_path_decisions = {}
+        self.frame_index_map = None
+        if frame_index_file:
+            with open(frame_index_file) as f:
+                self.frame_index_map = json.load(f)
+            bad = [k for k, v in self.frame_index_map.items() if len(v) != max_frames_num]
+            if bad:
+                raise ValueError(f"{frame_index_file}: {len(bad)} videos do not have max_frames_num={max_frames_num} frame indices, e.g. {bad[0]}")
+            eval_logger.info(f"Using precomputed frame indices for {len(self.frame_index_map)} videos from {frame_index_file}")
         overwrite_config = {}
         overwrite_config["mm_spatial_pool_stride"] = self.mm_spatial_pool_stride
         overwrite_config["mm_spatial_pool_mode"] = self.mm_spatial_pool_mode
@@ -163,16 +181,38 @@ class CambrianP(lmms):
 
         if '7b' not in pretrained.lower():
             overwrite_config["tie_word_embeddings"] = True
-        
+
         overwrite_config["camera_token_indices"] = [0]
-        
+
+        self.vggt_feat_dir = vggt_feat_dir
+        self.vggt_token_source = vggt_token_source
+        self._last_frame_idx = None
+        lora_config = {}
+        if lora_path is not None and os.path.exists(os.path.join(lora_path, "config.json")):
+            with open(os.path.join(lora_path, "config.json")) as f:
+                lora_config = json.load(f)
+        use_vggt_token = vggt_feat_dir is not None or lora_config.get("use_vggt_token", False)
+        self.vggt_gather_mode = vggt_gather_mode if vggt_gather_mode is not None else lora_config.get("vggt_gather_mode", "none")
+        if lora_path is not None and vggt_gather_mode is not None and vggt_gather_mode != lora_config.get("vggt_gather_mode", "none"):
+            raise ValueError("Do not change the adapter's trained gather mode; use vggt_gather_scope=self for a no-gather ablation")
+        if use_vggt_token:
+            overwrite_config["use_vggt_token"] = True
+            overwrite_config["vggt_token_dim"] = lora_config.get("vggt_token_dim", 2048)
+            overwrite_config["vggt_gather_mode"] = self.vggt_gather_mode
+            for name, value, default in (
+                ("vggt_gather_radius", vggt_gather_radius, 0.15),
+                ("vggt_gather_scope", vggt_gather_scope, "all"),
+                ("vggt_gather_far_gap", vggt_gather_far_gap, 32),
+            ):
+                overwrite_config[name] = type(default)(value) if value is not None else lora_config.get(name, default)
+
         cfg_pretrained = LlavaQwenConfig.from_pretrained(self.pretrained)
-        
+
         if "cambrian" in self.pretrained.lower():
             # start to cast the config to LlavaQwenConfig
             from cambrianp.utils import cast_cambrian_config_to_llava_ov_style
-            cfg_pretrained = cast_cambrian_config_to_llava_ov_style(cfg_pretrained, self.pretrained)
 
+            cfg_pretrained = cast_cambrian_config_to_llava_ov_style(cfg_pretrained, self.pretrained)
 
         if cfg_pretrained.architectures[0] == "LlavaLlamaForCausalLM":  # Ugly code, only used in  vicuna that needs ROPE
             if "224" in cfg_pretrained.mm_vision_tower:
@@ -194,6 +234,31 @@ class CambrianP(lmms):
             # for older versions of LLaVA that don't have multimodal argument
             llava_model_args.pop("multimodal", None)
             self._tokenizer, self._model, self._image_processor, self._max_length = load_pretrained_model(pretrained, None, model_name, device_map=self.device_map, **llava_model_args)
+
+        if use_vggt_token:
+            # The projector is not in the base checkpoint; a trained one (and its stats) comes from the LoRA adapter below.
+            vggt_projector = self._model.get_model().vggt_projector
+            vggt_projector.float()
+            vggt_projector.reset_parameters()
+            if vggt_token_stats is not None:
+                vggt_projector.load_stats(vggt_token_stats)
+        if lora_path is not None:
+            from peft import PeftModel
+
+            peft_model = PeftModel.from_pretrained(self._model, lora_path)
+            trained_vggt_projector = "vggt_projector" in (peft_model.peft_config["default"].modules_to_save or [])
+            self._model = peft_model.merge_and_unload()
+            print(f"[cambrian_p] Merged LoRA adapter from {lora_path}", flush=True)  # eval_logger.info is not shown (no handler)
+        else:
+            trained_vggt_projector = False
+        if use_vggt_token:
+            if not trained_vggt_projector:
+                eval_logger.warning("VGGT projector is untrained (randomly initialised, not in the LoRA adapter): VGGT tokens are random features")
+            else:
+                w_out = self._model.get_model().vggt_projector.mlp[2].weight
+                print(f"[cambrian_p] VGGT projector output-layer weight rms {w_out.float().pow(2).mean().sqrt().item():.3e}", flush=True)
+        if vggt_feat_dir is not None:
+            print(f"[cambrian_p] Appending VGGT tokens ({vggt_token_source}) from {vggt_feat_dir}", flush=True)
 
         self._config = self._model.config
         self.model.eval()
@@ -499,12 +564,20 @@ class CambrianP(lmms):
         total_frame_num = len(vr)
         uniform_sampled_frames = np.linspace(0, total_frame_num - 1, max_frames_num, dtype=int)
         frame_idx = uniform_sampled_frames.tolist()
+        if self.frame_index_map is not None:
+            key = "/".join(video_path.split(os.sep)[-2:])
+            if key in self.frame_index_map and max(self.frame_index_map[key]) < total_frame_num:
+                frame_idx = [int(i) for i in self.frame_index_map[key]]
+            else:
+                eval_logger.warning(f"No valid precomputed frame indices for {key}; using uniform sampling.")
+        self._last_frame_idx = frame_idx
 
         if self._should_use_safe_decord_path(video_path, total_frame_num):
             try:
                 return self._load_video_chunked(video_path, frame_idx)
             except Exception as exc:
                 eval_logger.warning(f"Safe Decord loading failed for {video_path}: {exc}. Falling back to PyAV.")
+                self._last_frame_idx = None
                 return read_video_pyav(video_path, num_frm=max_frames_num)
 
         try:
@@ -521,7 +594,17 @@ class CambrianP(lmms):
                 eval_logger.warning(
                     f"Chunked Decord loading failed for {video_path}: {chunk_exc}. Falling back to PyAV."
                 )
+                self._last_frame_idx = None
                 return read_video_pyav(video_path, num_frm=max_frames_num)
+
+    def _load_vggt_feats(self, video_path, num_frames):
+        if self._last_frame_idx is None or len(self._last_frame_idx) != num_frames:
+            raise RuntimeError(f"VGGT tokens need the decord frame indices of {video_path} (got none, e.g. after a PyAV fallback)")
+        npz_path = vggt_feature_path(self.vggt_feat_dir, video_path)
+        tokens = load_vggt_tokens(npz_path, self.vggt_token_source, frame_idx=self._last_frame_idx, gather_mode=self.vggt_gather_mode)
+        if isinstance(tokens, dict):
+            return {k: torch.from_numpy(v).to(self.device) for k, v in tokens.items()}
+        return torch.from_numpy(tokens).to(self.device)
 
     def _load_video_frames(self, video_path, max_frames_num):
         resolved_video_path = self._resolve_video_path(video_path)
@@ -570,6 +653,7 @@ class CambrianP(lmms):
             question_input = []
 
             video_path_for_features = None
+            vggt_feats = None
             image_size = None
             for visual, context in zip(batched_visuals, batched_contexts):
                 if visual is None or visual == []:  # for text-only tasks.
@@ -612,6 +696,7 @@ class CambrianP(lmms):
                     elif type(visual[0]) == str:  # For video task
                         video_path_for_features = visual[0]  # video path names
                         image_tensor = []
+                        self._last_frame_idx = None
                         try:
                             frames = self._load_video_frames(visual, self.max_frames_num)
 
@@ -624,6 +709,10 @@ class CambrianP(lmms):
                         except Exception as e:
                             eval_logger.error(f"Error {e} in loading video")
                             image_tensor = None
+
+                        # Outside the try above: a missing/misaligned feature file must fail loudly, not drop the video.
+                        if self.vggt_feat_dir is not None and image_tensor is not None:
+                            vggt_feats = [self._load_vggt_feats(self._resolve_video_path(visual), len(frames))]
 
                         task_type = "video"
                         placeholder_count = len(frames) if self.token_strategy == "multiple" else 1
@@ -682,7 +771,7 @@ class CambrianP(lmms):
 
             text_outputs = self._run_inference_step(
                 input_ids, attention_masks, image_tensor, image_size,
-                task_type, gen_kwargs, video_path_for_features,
+                task_type, gen_kwargs, video_path_for_features, vggt_feats=vggt_feats,
             )
             res.extend(text_outputs)
             self.cache_hook.add_partial("generate_until", (context, gen_kwargs), text_outputs)
@@ -694,7 +783,7 @@ class CambrianP(lmms):
         return res
 
     def _run_inference_step(self, input_ids, attention_masks, image_tensor, image_size,
-                            task_type, gen_kwargs, video_path_for_features):
+                            task_type, gen_kwargs, video_path_for_features, vggt_feats=None):
         # preconfigure gen_kwargs with defaults
         if "max_new_tokens" not in gen_kwargs:
             gen_kwargs["max_new_tokens"] = 1024
@@ -728,8 +817,9 @@ class CambrianP(lmms):
             gen_kwargs.pop("image_aspect_ratio")
 
         try:
+            extra_inputs = {"vggt_feats": vggt_feats} if vggt_feats is not None else {}
             with torch.inference_mode():
-                cont, _ = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=image_tensor, use_cache=self.use_cache, image_sizes=image_size, **gen_kwargs)
+                cont, _ = self.model.generate(input_ids, attention_mask=attention_masks, pad_token_id=pad_token_ids, images=image_tensor, use_cache=self.use_cache, image_sizes=image_size, **extra_inputs, **gen_kwargs)
 
             text_outputs = self.tokenizer.batch_decode(cont, skip_special_tokens=True)
         except Exception as e:

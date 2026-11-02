@@ -485,6 +485,11 @@ class VGGTReconstructor(nn.Module):
 
         learnable_tokens = torch.stack(learnable_tokens_list, dim=0)
         learnable_tokens = learnable_tokens.view(batch_size, num_frame, -1, feat_dim)
+
+        # VGGT tokens (llava_arch.inject_vggt_tokens) are the last tokens of each frame; they are inputs, not rec tokens.
+        vggt_token_count = info_dict_list[0].get("vggt_token_count", 0)
+        if vggt_token_count:
+            learnable_tokens = learnable_tokens[:, :, :-vggt_token_count]
         
         token_per_frame = learnable_tokens.shape[-2]
         

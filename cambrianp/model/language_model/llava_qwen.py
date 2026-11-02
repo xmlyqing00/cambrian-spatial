@@ -32,6 +32,7 @@ from transformers.models.qwen2.modeling_qwen2 import QWEN2_INPUTS_DOCSTRING, _CO
 from vggt.train_utils.normalization import normalize_camera_extrinsics_and_points_batch
 
 import os
+from cambrianp.constants import IGNORE_INDEX
 from cambrianp.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
 
 class LlavaQwenConfig(Qwen2Config):
@@ -106,6 +107,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         has_rec_views_mask: Optional[List[bool]] = None,
         bp_vqa: Optional[bool] = None,
         bp_rec: Optional[bool] = None,
+        vggt_feats: Optional[List[Any]] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         if inputs_embeds is None:
 
@@ -115,7 +117,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
              info_dict_list) = self.prepare_inputs_labels_for_multimodal(
                 input_ids, position_ids, attention_mask, past_key_values,
                 labels, images, modalities, image_sizes, bp_rec=bp_rec,
-                bp_vqa=bp_vqa,
+                bp_vqa=bp_vqa, vggt_feats=vggt_feats,
             )
              
         if dpo_forward:
@@ -230,7 +232,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
                 dummy_rec_loss = sum(p.sum() for p in self.model.rec_head.parameters()) * 0
                 outputs.loss = outputs.loss + dummy_rec_loss
             
-            if not self.training and self.model.load_rec_model and getattr(self.config, "use_camera_tokens", False):
+            if not self.training and labels is None and self.model.load_rec_model and getattr(self.config, "use_camera_tokens", False):
                 # Dummy rec_views for the generating phase.
                 batch_size = 1
                 rec_views = {
@@ -308,6 +310,23 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         )
 
         hidden_states = outputs[0]
+
+        if labels is not None and getattr(self.config, "lm_loss_labels_only", False) and not custom_llm_ce_loss:
+            # Same mean CE as below, but logits only at supervised positions (full-vocab logits for ~10k video tokens cost ~20 GB).
+            shift_labels = labels[..., 1:]
+            supervised = shift_labels.ne(IGNORE_INDEX)
+            logits = self.lm_head(hidden_states[..., :-1, :][supervised]).float()
+            loss = nn.functional.cross_entropy(logits, shift_labels[supervised].to(logits.device))
+            if not return_dict:
+                return (loss, logits) + outputs[1:]
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+
         logits = self.lm_head(hidden_states)
         logits = logits.float()
         
@@ -351,6 +370,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
         rec_views: Optional[Any] = None,
         bp_vqa: Optional[bool] = None,
         bp_rec: Optional[bool] = None,
+        vggt_feats: Optional[List[Any]] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
@@ -362,7 +382,7 @@ class LlavaQwenForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
             (inputs, position_ids, attention_mask, _, inputs_embeds, _,
              info_dict_list) = self.prepare_inputs_labels_for_multimodal(
                 inputs, position_ids, attention_mask, None, None, images, modalities,
-                image_sizes=image_sizes, bp_rec=bp_rec, bp_vqa=bp_vqa,
+                image_sizes=image_sizes, bp_rec=bp_rec, bp_vqa=bp_vqa, vggt_feats=vggt_feats,
             )
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)

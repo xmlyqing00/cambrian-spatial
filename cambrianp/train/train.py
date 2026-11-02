@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 import json
 import logging
+import math
 import pathlib
 from typing import Dict, Optional, Sequence, List
 from PIL import Image, ImageFile
@@ -44,6 +45,15 @@ from cambrianp import conversation as conversation_lib
 from cambrianp.model import *
 from cambrianp.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from cambrianp.utils import rank0_print
+from cambrianp.model.multimodal_projector.vggt_token import (
+    load_vggt_tokens,
+    vggt_feature_path,
+    check_vggt_features,
+    VGGTFeatureError,
+    VGGT_TOKEN_SOURCES,
+    VGGT_GATHER_MODES,
+    VGGT_GATHER_SCOPES,
+)
 from cambrianp.datasets import load_3r_dataset
 
 import cambrianp.datasets.rec_dataloading_utils as rec_utils
@@ -112,28 +122,28 @@ class ModelArguments:
 
     use_pos_skipping: Optional[bool] = field(default=False)
     pos_skipping_range: Optional[int] = field(default=4096)
-    
+
     mm_newline_position: Optional[str] = field(default="grid")
     delay_load: Optional[bool] = field(default=True)
     add_faster_video: Optional[bool] = field(default=False)
     faster_token_stride: Optional[int] = field(default=10)
-    
+
     # add reconstruction related configs
     load_rec_model: Optional[bool] = False
     rec_projector_type: Optional[str] = field(default="linear")
     head_name: Optional[str] = None
     rec_model_path: Optional[str] = None
-    
+
     token_num: Optional[int] = field(default=197)
     camera_tokens_mode: Optional[str] = field(default="camera_tokens")
     query_mode: Optional[str] = field(default="query_after_question")
     camera_tokens_place: Optional[str] = field(default="prepend_to_frame")  # options=['between_qa', 'prepend_to_frame', 'append_to_frame']
-    
+
     rec_loss_weight: Optional[float] = field(default=0.1)
     rec_camera_loss_weight: Optional[float] = field(default=5.0)
     rec_camera_loss_type: Optional[str] = field(default="l1")
     rec_camera_loss_components: Optional[str] = field(default="all")  # ["all", "translation", "rotation", "focal"]
-    
+
     rec_camera_loss_weight_trans: Optional[float] = field(default=1.0)
     rec_camera_loss_weight_rot: Optional[float] = field(default=1.0)
     rec_camera_loss_weight_focal: Optional[float] = field(default=0.5)
@@ -144,11 +154,11 @@ class ModelArguments:
     rec_depth_valid_range: Optional[float] = field(default=0.98)
     query_loss_frame_idx: Optional[int] = field(default=None)
     rec_depth_head_patch_start_idx: Optional[int] = field(default=0)
-    
+
     enable_point: Optional[bool] = field(default=False) 
     enable_depth: Optional[bool] = field(default=False)
     enable_camera: Optional[bool] = field(default=False)
-    
+
     num_intermediate_layers: Optional[int] = field(default=4)
     rec_embed_dim: Optional[int] = field(default=2048)
     rec_camera_trunk_depth: Optional[int] = field(default=4)
@@ -159,10 +169,20 @@ class ModelArguments:
 
     enable_rec_pose_viz: bool = field(default=True)
     rec_pose_viz_frequency: int = field(default=256)
-    
+
     # Scale alignment direction for non-metric datasets
     # When aligning non-metric datasets, rescale predicted translations to match GT instead of rescaling GT to match pred.
     rescale_pred_not_gt: Optional[bool] = field(default=False)
+
+    # VGGT-17: one precomputed VGGT token appended to every frame (cambrianp/model/multimodal_projector/vggt_token.py)
+    use_vggt_token: bool = field(default=False)
+    vggt_token_dim: int = field(default=2048)
+    vggt_token_stats: Optional[str] = field(default=None, metadata={"help": "npz with per-dim feature mean/std (scripts/vggt17/feature_stats.py)"})
+    vggt_gather_mode: str = field(default="none", metadata={"help": "'lookat' gathers shared-frame 3D looked-at locations; 'none' is the VGGT anchor baseline"})
+    vggt_gather_radius: float = field(default=0.15, metadata={"help": "Same-place radius as a fraction of each clip's median camera-to-look-at depth"})
+    vggt_gather_scope: str = field(default="all", metadata={"help": "'all', 'near', 'far', or 'self' for matched-token-budget ablations"})
+    vggt_gather_far_gap: int = field(default=32, metadata={"help": "Near/far boundary in uniformly sampled anchor positions"})
+    lm_loss_labels_only: bool = field(default=False, metadata={"help": "Same LM loss, but logits only at supervised positions (full-vocab logits over ~10k video tokens cost ~20 GB)"})
 
 @dataclass
 class DataArguments:
@@ -181,18 +201,19 @@ class DataArguments:
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
     video_load_timeout: Optional[float] = field(default=120.0)
-    
+
     load_rec_data: Optional[bool] = field(default=False)
     use_augs: Optional[bool] = field(default=False)
     rec_resolution: Optional[int] = field(default=384)
     json_file: Optional[str] = field(default=None)
+    eval_json_file: Optional[str] = field(default=None, metadata={"help": "Separate scene-disjoint validation JSONL; not VSI-Bench"})
     data_mode: Optional[str] = field(default=None)
     sample_jitter: Optional[float] = field(default=0.0)
     rec_data_mode: Optional[str] = field(default='cut3r')
-    
+
     # ViPE Cambrian-S rec data mode, default should be temporal
     vipe_cambrians_rec_data_mode: Optional[str] = field(default='uniform')
-    
+
     # interleaved training
     interleaved_training: Optional[bool] = field(default=False)
     interleaved_aug_rec_ratio: Optional[float] = field(default=1.0)
@@ -204,7 +225,7 @@ class DataArguments:
     spring_sample_weight: Optional[float] = field(default=1.0,
         metadata={"help": "Multiplier applied to spring dataset sampling weights in num_frame augmentation mode"})
     force_bp_rec: Optional[bool] = field(default=True)
-    
+
     # data augs
     rescale: Optional[bool] = field(default=True) # For BothBaseDataset
     rescale_aug: Optional[bool] = field(default=False) # For BaseDataset
@@ -216,8 +237,8 @@ class DataArguments:
     rec_image_augs: Optional[bool] = field(default=True)
     rec_rec_sup_augs: Optional[bool] = field(default=True)
     keep_only_dummy_vqa: Optional[bool] = field(default=False)
-    
-   # CUT3R mode parameters - control frame sampling behavior for Cut3r dataset
+
+       # CUT3R mode parameters - control frame sampling behavior for Cut3r dataset
     cut3r_scannet_max_interval: Optional[int] = field(default=30,
         metadata={"help": "Maximum frame gap between consecutive frames in Cut3r video mode for ScanNet"})
     cut3r_scannet_min_interval: Optional[int] = field(default=1,
@@ -276,43 +297,43 @@ class DataArguments:
 
     scale_by_points: bool = field(default=True)
     load_depth_data: bool = field(default=True)
-    
+
     custom_system_prompt: Optional[str] = field(default=None)
-    
+
     # Set None in script if not using mapanything dataset
     mapanything_data_path: Optional[str] = field(
         default=None,
     )
-    
+
     mapanything_data_root: Optional[str] = field(
         default=None,   
     )
-    
+
     # Covisibility threshold for each dataset
     # Covisibility threshold for MPSD dataset
     mpsd_covis_thres: Optional[float] = field(default=0.15)
-    
+
     # Covisibility threshold for ETH3D dataset
     eth3d_covis_thres: Optional[float] = field(default=0.3) 
-    
+
     # Covisibility threshold for all other MapAnything datasets
     others_covis_thres: Optional[float] = field(default=0.15)
-    
+
     # Apply Sim(3) alignment for non-metric datasets (MegaDepth, DL3DV, BlendedMVS)
     # Required when training on datasets with non-metric scale
     use_scale_alignment: bool = field(default=False)
 
     # Normalize translation loss by trajectory length to prevent large scenes dominating
     use_trajectory_balance: bool = field(default=False)
-    
+
     # Only use metric-scale MapAnything datasets (skip MegaDepth, DL3DV, BlendedMVS)
     use_metric_only: bool = field(default=False)
 
     # Set None in script if not using vipe dataset (dpsp and wsdg)
     vipe_data_path: Optional[str] = field(default=None)
-    
+
     vipe_data_root: Optional[str] = field(default=None)
-    
+
     vipe_cambrians_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to ViPE Cambrian-S scenes JSON"}
@@ -331,17 +352,17 @@ class DataArguments:
         default=None,
         metadata={"help": "Root for ViPE pose/depth results"}
     )
-    
+
     # ViPE Cambrian-S scene filtering parameters
     # we filter scenes outside [min, max] set for velocity and rotation rate
     # Upper bound on max_velocity and max_rotation_rate
     vipe_cambrians_max_velocity: Optional[float] = field(default=None)
     vipe_cambrians_max_rotation_rate: Optional[float] = field(default=None)
-    
+
     # Lower bound on max_velocity and max_rotation_rate
     vipe_cambrians_max_velocity_lower_bound: Optional[float] = field(default=None)
     vipe_cambrians_max_rotation_rate_lower_bound: Optional[float] = field(default=None)
-    
+
     # Path to JSON with per-source include/exclude. None=use all.
     vipe_cambrians_source_config: Optional[str] = field(default=None)
     # MapAnything frame ordering
@@ -358,6 +379,11 @@ class DataArguments:
                   "Options: text_overlay,synthetic,screen_recording,blurry,quality_issues,moving_vehicle. "
                   "Example: --vlm_filter_categories_to_exclude text_overlay,synthetic,screen_recording"}
     )
+
+    vggt_feat_dir: Optional[str] = field(default=None, metadata={"help": "Precomputed VGGT-17 features, <dir>/<video dir>/<video stem>.npz"})
+    vggt_token_source: str = field(default="group", metadata={"help": "'group' (anchor of its 17-frame pass) or 'scene'"})
+    video_camera_tokens: bool = field(default=False, metadata={"help": "Camera tokens in VQA-only video samples, as at eval (no pose loss without rec views)"})
+    video_pad_to_square: bool = field(default=False, metadata={"help": "Pad video frames to square with the image mean, as the lmms-eval wrapper does"})
 
 
 @dataclass
@@ -381,6 +407,12 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
+    lora_llm_only: bool = field(default=False, metadata={"help": "LoRA on the LLM decoder linears only; all else frozen except lora_modules_to_save"})
+    lora_modules_to_save: Optional[str] = field(default=None, metadata={"help": "Comma-separated modules trained in full and saved with the adapter, e.g. vggt_projector"})
+    vggt_projector_lr: Optional[float] = None
+    vggt_projector_clip_separately: bool = field(default=True, metadata={"help": "Clip the VGGT projector's gradient norm (max_grad_norm) on its own, so it does not set the clip factor of the other (LoRA) gradients"})
+    max_gpu_mem_gb: float = field(default=0.0, metadata={"help": "Cap this process's CUDA caching allocator at N GiB (0 = no cap), so a shared GPU OOMs this job rather than its neighbours"})
+    vision_tower_chunk_size: int = field(default=0, metadata={"help": "Run the vision tower over at most N frames at a time (0 = all at once); bounds its transient memory"})
     mm_projector_lr: Optional[float] = None
     mm_vision_tower_lr: Optional[float] = None
     vggt_cam_projector_lr: Optional[float] = None
@@ -393,6 +425,7 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_modality_length_auto: bool = field(default=False)
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
+    gradient_checkpointing_use_reentrant: Optional[bool] = field(default=None, metadata={"help": "Override checkpoint reentrancy without passing dict-valued CLI arguments; False supports mixed-modality DDP unused-parameter detection"})
     verbose_logging: bool = field(default=False)
     attn_implementation: str = field(default="flash_attention_2", metadata={"help": "Use transformers attention implementation."})
     
@@ -401,7 +434,12 @@ class TrainingArguments(transformers.TrainingArguments):
     
     unpad_image: Optional[bool] = field(default=False)
     rec_free_tail_ratio: float = field(default=0.0, metadata={"help": "Fraction of each epoch's tail that should be free of rec samples (e.g., 0.1 = last 10% rec-free). Default 0.0 = disabled."})
-    
+
+    def __post_init__(self):
+        if self.gradient_checkpointing_use_reentrant is not None:
+            self.gradient_checkpointing_kwargs = dict(self.gradient_checkpointing_kwargs or {}, use_reentrant=self.gradient_checkpointing_use_reentrant)
+        super().__post_init__()
+
 
 # @dataclass
 # class EvaluationArguments:
@@ -1237,7 +1275,10 @@ class LazySupervisedDataset(Dataset):
         if self.data_args.keep_only_dummy_vqa:
             self.list_data_dict = [sample for sample in self.list_data_dict if sample.get('dummy_vqa', False)]
 
- 
+        if self.data_args.vggt_feat_dir is not None:
+            self._check_vggt_feats()
+
+
     def _load_main_jsonl_sources(self, json_files):
         """Load primary VQA jsonl/json file(s) into self.list_data_dict."""
         rank0_print(f"Loading datasets from {json_files}")
@@ -1432,13 +1473,13 @@ class LazySupervisedDataset(Dataset):
                 scene_video_path_dict[sample['video']] = sample
 
         return rec_subset, scene_video_path_dict
-    
+
     def augment_data_scene_unified(self, aug_rec_ratio, rec_subset, unique_scenes):
         # num_aug_samples = int(len(self.list_data_dict) * aug_rec_ratio)
         num_aug_samples = int(len(rec_subset) * aug_rec_ratio)
         rank0_print(f"Augmenting data for interleaved training with ratio {aug_rec_ratio}, num_aug_samples = {num_aug_samples}")
         # count all unique scenes in the dataset and their video path
-        
+
         num_sample_per_scene = num_aug_samples // len(unique_scenes)
         for video_path, rep_sample in unique_scenes.items():
             question_value = '<video>pad question'
@@ -1464,7 +1505,7 @@ class LazySupervisedDataset(Dataset):
                 'loading_type': 'rec',
                 'dummy_vqa': True,
             }
-  
+
             # For ViPE-Cambrians scenes, this copies data_source, rgb_path,
             # pose_path, etc. so _get_item can route to the ViPE loader.
             for field in vipe_utils.REC_META_FIELDS:
@@ -1524,7 +1565,7 @@ class LazySupervisedDataset(Dataset):
                 # Only MapAnything scenes need absolute<->relative key aliasing.
                 if not ma_utils.is_mapanything_source_dataset(sample.get("source_dataset", None)):
                     continue
-                
+
                 video_key = str(sample.get("video", "")).strip()
                 if not video_key:
                     continue
@@ -1712,7 +1753,7 @@ class LazySupervisedDataset(Dataset):
         else:
             image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
         return image, image_size, "image"
-    
+
     def _filter_vipe_cambrians_entries(self, entries, data_args):
         """
         Filter ViPE-Cambrians entries: keep only entries where
@@ -1773,7 +1814,7 @@ class LazySupervisedDataset(Dataset):
             rank0_print(f"[ViPE-Cambrians]   Rejected by {reason}: {count}")
 
         return filtered
-    
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         timeout_s = float(getattr(self.data_args, "video_load_timeout", 120.0))
 
@@ -1797,6 +1838,8 @@ class LazySupervisedDataset(Dataset):
                 try:
                     return _fetch(i)
                 except Exception as e:
+                    if isinstance(e, VGGTFeatureError):
+                        raise
                     print(f"[Skip] sample={i} file={_source_path(i)} attempt={attempt_idx} error={type(e).__name__}: {e}", flush=True)
 
             for attempt_idx in range(3):
@@ -1804,6 +1847,8 @@ class LazySupervisedDataset(Dataset):
                 try:
                     return _fetch(next_index)
                 except Exception as e:
+                    if isinstance(e, VGGTFeatureError):
+                        raise
                     print(f"[Skip] fallback sample={next_index} file={_source_path(next_index)} attempt={attempt_idx} error={type(e).__name__}: {e}", flush=True)
 
             try:
@@ -1822,6 +1867,8 @@ class LazySupervisedDataset(Dataset):
                 sample = self._get_item(i)
                 return sample
             except Exception as e:
+                if isinstance(e, VGGTFeatureError):
+                    raise
                 print(f"[Try #{attempt_idx}] Failed to fetch sample {i}. Exception:", e)
 
         # try other samples, in case it is file corruption issue
@@ -1832,6 +1879,8 @@ class LazySupervisedDataset(Dataset):
                 sample = self._get_item(next_index)
                 return sample
             except Exception as e:
+                if isinstance(e, VGGTFeatureError):
+                    raise
                 # no need to sleep
                 print(f"[Try other #{attempt_idx}] Failed to fetch sample {next_index}. Exception:", e)
                 pass
@@ -1841,24 +1890,25 @@ class LazySupervisedDataset(Dataset):
             return sample
         except Exception as e:
             raise e
-        
+
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
-        
+
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Expected single source per sample"
-        
+
         sample_info = f"Sample #{i}"
         modality = "text"  # default
         video_file = None
         interval_stats = None
         rec_views = None
+        vggt_feats = None
         # === IMAGE PROCESSING ===
         if "image" in sources[0]:
             modality = "image"
             image_file = self.list_data_dict[i]["image"]
-            
+
             if isinstance(image_file, list):
                 image = [self.process_image(f) for f in image_file]
                 # Multi-image handling with padding
@@ -1868,14 +1918,14 @@ class LazySupervisedDataset(Dataset):
             else:
                 image = [self.process_image(image_file)]
             sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
-        
+
         # === VIDEO PROCESSING ===
         elif "video" in sources[0]:
             modality = "video"
             video_file = self.list_data_dict[i]["video"]
             video_file = os.path.join(self.data_path, video_file)
             scene_ids_file = osp.basename(video_file)
-            
+
             loading_type = self.list_data_dict[i].get('loading_type', None)
 
             # this variable is used to distinguish between real_vqa and the dummy padded vqa samples
@@ -1888,10 +1938,10 @@ class LazySupervisedDataset(Dataset):
             if not os.path.exists(video_file):
                 print(f"File {video_file} not exist!")
                 return self._get_item(i + 1)
-            
+
             num_frames_to_sample = self.data_args.frames_upbound if self.data_args.force_sample else 32
             video = None
-            
+
             allow_repeat = getattr(self, 'allow_repeat', False)  # by default, no repeat
 
             # Detect dataset type from path
@@ -1912,7 +1962,7 @@ class LazySupervisedDataset(Dataset):
                 if vipe_utils.is_vipe_cambrians_scene(self.list_data_dict[i]):
                     # ViPE-annotated Cambrian-S
                     vipe_sample_mode = self.data_args.vipe_cambrians_rec_data_mode
-                        
+
                     try:
                         video, selected_basenames, rec_views = vipe_utils.load_vipe_cambrians_scene(
                             scene_entry=self.list_data_dict[i],
@@ -1930,7 +1980,7 @@ class LazySupervisedDataset(Dataset):
                         traceback.print_exc()
                         next_index = random.choice([j for j in range(len(self.list_data_dict)) if j != i])
                         return self._get_item(next_index)
-                        
+
                 elif vipe_utils.is_vipe_scene(self.list_data_dict[i]):
                     # ViPE format (WSDG/W360/DPSP) - video-based with ZIP depth
                     try:
@@ -1947,7 +1997,7 @@ class LazySupervisedDataset(Dataset):
                         print(f"[ViPE] Failed to load {video_file}: {e}")
                         next_index = random.choice([j for j in range(len(self.list_data_dict)) if j != i])
                         return self._get_item(next_index)
-                                    
+
                 elif ma_utils.is_mapanything_scene(video_file):
                     # MapAnything format - loads video + rec_views together
                     try:
@@ -1981,7 +2031,7 @@ class LazySupervisedDataset(Dataset):
                     assert dataset_type is not None, "dataset_type must be provided for scene_dir"
                     cut3r_params = rec_utils.build_cut3r_params(dataset_type, self.data_args) if sample_mode == 'cut3r' else None
                     temporal_params = rec_utils.build_temporal_params(dataset_type, self.data_args)
-                    
+
                     video, selected_basenames, interval_stats = rec_utils.load_scene_frames(
                         video_file=video_file,
                         dataset_type=dataset_type,
@@ -1992,7 +2042,7 @@ class LazySupervisedDataset(Dataset):
                         data_args=self.data_args,
                         allow_repeat=allow_repeat,
                     )
-                    
+
                     # CO3D needs 'apple/' prefix
                     scene_ids_file_for_rec = rec_utils.adjust_scene_id_for_dataset(scene_ids_file, dataset_type)
 
@@ -2001,7 +2051,7 @@ class LazySupervisedDataset(Dataset):
                         interleaved=self.data_args.interleaved_training,
                         has_vqa=is_real_vqa
                     )
-                    
+
                     rec_dataset = load_3r_dataset(
                         self.data_args,
                         scene_ids_file_for_rec,
@@ -2010,7 +2060,7 @@ class LazySupervisedDataset(Dataset):
                         input_use_augs=strategy.get_input_augs(self.data_args),
                         rec_use_augs=strategy.get_rec_augs(self.data_args),
                     )
-                    
+
                     rec_views = rec_dataset.get_data(
                         seq_index=0,
                         img_per_seq=num_frames_to_sample, 
@@ -2018,16 +2068,19 @@ class LazySupervisedDataset(Dataset):
                     )
             else:
                 raise ValueError(f"Cannot determine how to load: {video_file}")
-            
+
             if video is None or len(video) == 0:
                 raise ValueError(f"Failed to load any frames from {video_file}")
-            
+
             processed_frames, original_size, image = vqa_utils.process_video_frames(
                 processor=self.data_args.image_processor,
                 video=video,
                 rec_views=rec_views,
                 is_real_vqa=is_real_vqa,
+                pad_to_square=self.data_args.video_pad_to_square and loading_type == "video_file",
             )
+            if self.data_args.vggt_feat_dir is not None:
+                vggt_feats = self._load_vggt_feats(i, video_file, loading_type, clip_info, len(processed_frames))
 
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]), self.data_args
@@ -2037,18 +2090,18 @@ class LazySupervisedDataset(Dataset):
 
         # Tokenization
         has_image = ("image" in self.list_data_dict[i]) or ("video" in self.list_data_dict[i])
-        
+
         custom_system_prompt = self.data_args.custom_system_prompt
         if self.data_args.custom_system_prompt is not None:
             data_dict = preprocess(sources, self.tokenizer, has_image=has_image, custom_system_prompt=custom_system_prompt)
         else:
             data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
-        
+
         prompt = data_dict.get("prompt", None)
 
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
-        
+
         # Add image/video data
         if "image" in self.list_data_dict[i]:
             data_dict["image"] = image
@@ -2061,25 +2114,70 @@ class LazySupervisedDataset(Dataset):
                 (torch.zeros(1, 3, crop_size["height"], crop_size["width"]), 
                 (crop_size["width"], crop_size["height"]), "text"),
             ]
-        
+
         if prompt is not None:
             data_dict["prompt"] = prompt
-        
+
         data_dict["id"] = self.list_data_dict[i].get("id", i)
-        
+
         if self.data_args.load_rec_data and rec_views is not None:
             data_dict["rec_views"] = rec_views
-        
+
         data_dict["bp_vqa"] = True if not self.data_args.force_no_bp_vqa else False
         # Set bp_rec = False for samples without rec_views (e.g., video files)
         data_dict["bp_rec"] = rec_views is not None
+        if self.data_args.video_camera_tokens and modality == "video" and rec_views is None:
+            # Camera tokens as at eval; without rec views the rec head only adds a zero loss.
+            data_dict["bp_rec"] = True
         if self.data_args.interleaved_training and rec_views is not None:
             data_dict["bp_vqa"] = is_real_vqa
             data_dict["bp_rec"] = not is_real_vqa or self.data_args.force_bp_rec
-        
+
+        if vggt_feats is not None:
+            data_dict["vggt_feats"] = vggt_feats
         if interval_stats is not None:
             data_dict["frame_interval_stats"] = interval_stats
         return data_dict
+
+    def _load_vggt_feats(self, i, video_file, loading_type, clip_info, num_frames):
+        """VGGT tokens of the frames fed to the LLM. The features cover whole videos sampled at linspace(0, n - 1, frames_upbound)."""
+        item = self.list_data_dict[i]
+        if loading_type != "video_file" or not self.data_args.force_sample or any(k in item for k in ("start_frame", "start")):
+            raise ValueError(f"VGGT tokens need whole-video uniform sampling (video file, force_sample, no clip bounds): {video_file}")
+        tokens = load_vggt_tokens(
+            vggt_feature_path(self.data_args.vggt_feat_dir, video_file),
+            self.data_args.vggt_token_source,
+            video_time=clip_info.video_time,
+            gather_mode=getattr(self.data_args, "vggt_gather_mode", "none"),
+        )
+        count = len(tokens["tokens"]) if isinstance(tokens, dict) else len(tokens)
+        if count != num_frames:
+            raise VGGTFeatureError(f"{video_file}: {count} VGGT tokens for {num_frames} frames")
+        if isinstance(tokens, dict):
+            return {k: torch.from_numpy(v) for k, v in tokens.items()}
+        return torch.from_numpy(tokens)
+
+    def _check_vggt_feats(self):
+        """Fail before training rather than have __getitem__ silently swap in other samples."""
+        videos = {e["video"] for e in self.list_data_dict if "video" in e}
+        missing = sorted(v for v in videos if not os.path.exists(vggt_feature_path(self.data_args.vggt_feat_dir, os.path.join(self.data_path, v))))
+        if missing:
+            raise FileNotFoundError(f"{len(missing)}/{len(videos)} videos have no VGGT features in {self.data_args.vggt_feat_dir}, e.g. {missing[:3]}")
+        invalid = []
+        for video in sorted(videos):
+            try:
+                check_vggt_features(
+                    vggt_feature_path(self.data_args.vggt_feat_dir, video),
+                    self.data_args.vggt_token_source,
+                    getattr(self.data_args, "vggt_gather_mode", "none"),
+                    self.data_args.frames_upbound,
+                )
+            except VGGTFeatureError as e:
+                invalid.append(str(e))
+        if invalid:
+            raise VGGTFeatureError(f"{len(invalid)}/{len(videos)} videos have incompatible features; examples: {invalid[:3]}")
+        rank0_print(f"VGGT features found for all {len(videos)} videos in {self.data_args.vggt_feat_dir}")
+
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
@@ -2111,7 +2209,7 @@ class DataCollatorForSupervisedDataset(object):
             batch["modalities"] = [im[2] for im_list in images for im in im_list]
             images = [im[0] for im_list in images for im in im_list]
             batch["images"] = images
-            
+
         # prompt exist in the data
         if "prompt" in instances[0]:
             batch["prompts"] = [instance["prompt"] for instance in instances]
@@ -2126,9 +2224,12 @@ class DataCollatorForSupervisedDataset(object):
 
         if "bp_vqa" in instances[0]:
             batch["bp_vqa"] = [instance["bp_vqa"] for instance in instances]
-        
+
         if "bp_rec" in instances[0]:
             batch["bp_rec"] = [instance["bp_rec"] for instance in instances]
+
+        if any("vggt_feats" in instance for instance in instances):
+            batch["vggt_feats"] = [instance.get("vggt_feats") for instance in instances]
 
         interval_stats_list = [
             inst.get("frame_interval_stats") 
@@ -2139,7 +2240,7 @@ class DataCollatorForSupervisedDataset(object):
             avg_intervals = [s["avg_interval"] for s in interval_stats_list]
             min_intervals = [s["min_interval"] for s in interval_stats_list]
             max_intervals = [s["max_interval"] for s in interval_stats_list]
-            
+
             batch["batch_avg_frame_interval"] = sum(avg_intervals) / len(avg_intervals)
             batch["batch_min_frame_interval"] = min(min_intervals) if min_intervals else 0
             batch["batch_max_frame_interval"] = max(max_intervals) if max_intervals else 0
@@ -2165,15 +2266,15 @@ class DataCollatorForSupervisedDataset(object):
         """
         if not batch_rec_views:
             return {}
-        
+
         batch_size = len(batch_rec_views)
         keys = batch_rec_views[0].keys()
-        
+
         stacked_dict = {}
-        
+
         for key in keys:
             values = [rec_view[key] for rec_view in batch_rec_views]
-            
+
             if key in ['images', 'depths', 'extrinsics', 'intrinsics', 'cam_points', 
                        'world_points', 'original_size']:
                 # Convert to tensors and stack along batch dimension
@@ -2192,7 +2293,7 @@ class DataCollatorForSupervisedDataset(object):
                     print(f"Warning: Could not stack {key} due to shape mismatch: {e}")
                     print(f"Shapes: {[t.shape for t in tensors]}")
                     stacked_dict[key] = tensors  # Keep as list if stacking fails
-                    
+
             elif key == 'point_masks':
                 tensors = []
                 for v in values:
@@ -2208,13 +2309,13 @@ class DataCollatorForSupervisedDataset(object):
                 except RuntimeError as e:
                     print(f"Warning: Could not stack {key} due to shape mismatch: {e}")
                     stacked_dict[key] = tensors
-                    
+
             elif key in ['ids']:
                 # Integer arrays
                 tensors = [torch.from_numpy(v) if isinstance(v, np.ndarray) else torch.tensor(v) 
                           for v in values]
                 stacked_dict[key] = torch.stack(tensors, dim=0).long()
-                
+
             elif key == 'is_video' or key == 'scale_by_points' or key == 'is_metric_scale':
                 # Boolean arrays/scalars
                 tensors = []
@@ -2226,11 +2327,11 @@ class DataCollatorForSupervisedDataset(object):
                     else:
                         tensors.append(torch.tensor(v).bool())
                 stacked_dict[key] = torch.stack(tensors, dim=0).bool()
-                            
+
             elif key in ['seq_name', 'basename', 'image_path','sample_mode']:
                 # String lists - keep as nested list
                 stacked_dict[key] = values
-                
+
             else:
                 # Default: try to stack as tensor
                 try:
@@ -2241,15 +2342,28 @@ class DataCollatorForSupervisedDataset(object):
                         stacked_dict[key] = values
                 except:
                     stacked_dict[key] = values
-        
+
         return stacked_dict
-    
+
+
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
 
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
+    eval_dataset = None
+    if data_args.eval_json_file:
+        eval_args = copy.copy(data_args)
+        eval_args.json_file = data_args.eval_json_file
+        eval_args.interleaved_training = False
+        eval_args.sample_jitter = 0.0
+        eval_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=eval_args.data_path, data_args=eval_args)
+        train_scenes = {vqa_utils.video_scene_key(e["video"]) for e in train_dataset.list_data_dict if "video" in e}
+        eval_scenes = {vqa_utils.video_scene_key(e["video"]) for e in eval_dataset.list_data_dict if "video" in e}
+        overlap = train_scenes & eval_scenes
+        if overlap:
+            raise ValueError(f"Train/validation scene overlap ({len(overlap)}), e.g. {sorted(overlap)[:3]}")
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
@@ -2261,20 +2375,20 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     customized_kwargs = dict()
     customized_kwargs.update(bnb_model_from_pretrained_args)
-    
+
     # Always load the correct config class based on model type
     if ("qwen" in model_args.model_name_or_path.lower() 
         or "cambrian" in model_args.model_name_or_path.lower()
     ):
         from cambrianp.model.language_model.llava_qwen import LlavaQwenConfig
         cfg_pretrained = LlavaQwenConfig.from_pretrained(model_args.model_name_or_path)
-        
+
         # if load a cambrian model, cast the config to LlavaQwenConfig
         if 'cambrian' in model_args.model_name_or_path.lower():
             # start to cast the config to LlavaQwenConfig
             from cambrianp.utils import cast_cambrian_config_to_llava_ov_style
             cfg_pretrained = cast_cambrian_config_to_llava_ov_style(cfg_pretrained, model_args.model_name_or_path)
-        
+
     elif "mistral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
         from cambrianp.model.language_model.llava_mistral import LlavaMistralConfig
         cfg_pretrained = LlavaMistralConfig.from_pretrained(model_args.model_name_or_path)
@@ -2290,12 +2404,12 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         cfg_pretrained = LlavaConfig.from_pretrained(model_args.model_name_or_path)
     else:
         cfg_pretrained = AutoConfig.from_pretrained(model_args.model_name_or_path)
-    
+
     overwrite_config = {}
-    
+
     overwrite_config["custom_llm_ce_loss"] = model_args.custom_llm_ce_loss
     overwrite_config["mm_spatial_pool_stride"] = model_args.mm_spatial_pool_stride
-     
+
     overwrite_config["token_num"] = model_args.token_num
     overwrite_config["load_rec_model"] = model_args.load_rec_model
     overwrite_config["enable_rec_pose_viz"] = model_args.enable_rec_pose_viz
@@ -2312,7 +2426,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     overwrite_config["rec_camera_loss_weight_trans"] = model_args.rec_camera_loss_weight_trans
     overwrite_config["rec_camera_loss_weight_rot"] = model_args.rec_camera_loss_weight_rot
     overwrite_config["rec_camera_loss_weight_focal"] = model_args.rec_camera_loss_weight_focal
-    
+
     overwrite_config["rec_camera_loss_type"] = model_args.rec_camera_loss_type
     overwrite_config["rec_camera_loss_components"] = model_args.rec_camera_loss_components
     overwrite_config["use_scale_alignment"] = model_args.use_scale_alignment
@@ -2332,6 +2446,13 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     overwrite_config["rec_dpt_head_type"] = model_args.rec_dpt_head_type
     overwrite_config["rec_depth_head_patch_start_idx"] = model_args.rec_depth_head_patch_start_idx
     overwrite_config["mm_img_tok_num"] = model_args.mm_img_tok_num
+    overwrite_config["use_vggt_token"] = model_args.use_vggt_token
+    overwrite_config["vggt_token_dim"] = model_args.vggt_token_dim
+    overwrite_config["vggt_gather_mode"] = model_args.vggt_gather_mode
+    overwrite_config["vggt_gather_radius"] = model_args.vggt_gather_radius
+    overwrite_config["vggt_gather_scope"] = model_args.vggt_gather_scope
+    overwrite_config["vggt_gather_far_gap"] = model_args.vggt_gather_far_gap
+    overwrite_config["lm_loss_labels_only"] = model_args.lm_loss_labels_only
 
     overwrite_config["unpad_image"] = training_args.unpad_image
 
@@ -2361,7 +2482,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
     if model_args.mm_spatial_pool_mode is not None:
         overwrite_config["mm_spatial_pool_mode"] = model_args.mm_spatial_pool_mode
-    
+
     # Apply any overwrite configs
     if overwrite_config:
         rank0_print(f"Overwriting config with {overwrite_config}")
@@ -2438,13 +2559,13 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
             else:
                 from cambrianp.utils import load_model_state_dict, verify_model_weights
-                
+
                 is_cambrian = 'cambrian' in model_args.model_name_or_path.lower()
                 new_state_dict = load_model_state_dict(
                     model_args.model_name_or_path, 
                     remap_cambrian=is_cambrian,
                 )
-                
+
                 model = LlavaQwenForCausalLM.from_pretrained(
                     model_args.model_name_or_path,
                     cache_dir=training_args.cache_dir,
@@ -2453,12 +2574,12 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                     low_cpu_mem_usage=False,
                     **customized_kwargs,
                 )
-                
+
                 if new_state_dict is not None:
                     model.load_state_dict(new_state_dict, strict=False)
-                    
+
                     verify_model_weights(model, new_state_dict)
-                    
+
                     del new_state_dict
                     torch.cuda.empty_cache()
 
@@ -2485,14 +2606,53 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
     return model
 
 
+def init_vggt_projector(model, model_args):
+    """Fresh fp32 VGGT-token projector (see VGGTTokenProjector.reset_parameters) and feature stats."""
+    projector = model.get_model().vggt_projector
+    projector.float()
+    projector.reset_parameters()
+    projector.load_stats(model_args.vggt_token_stats)
+    rank0_print(f"VGGT token projector initialized (fp32), feature stats from {model_args.vggt_token_stats}")
+
+
+def check_vggt_args(model_args, data_args, training_args):
+    if model_args.use_vggt_token != (data_args.vggt_feat_dir is not None):
+        raise ValueError("--use_vggt_token and --vggt_feat_dir go together")
+    if training_args.lora_llm_only and not training_args.lora_enable:
+        raise ValueError("--lora_llm_only needs --lora_enable")
+    if model_args.vggt_gather_mode not in VGGT_GATHER_MODES:
+        raise ValueError(f"--vggt_gather_mode must be one of {VGGT_GATHER_MODES}")
+    if model_args.vggt_gather_mode != "none" and not model_args.use_vggt_token:
+        raise ValueError("--vggt_gather_mode lookat needs --use_vggt_token")
+    if not model_args.use_vggt_token:
+        return
+    if model_args.vggt_gather_radius <= 0 or not math.isfinite(model_args.vggt_gather_radius):
+        raise ValueError("--vggt_gather_radius must be positive and finite")
+    if model_args.vggt_gather_scope not in VGGT_GATHER_SCOPES or model_args.vggt_gather_far_gap < 1:
+        raise ValueError("Invalid --vggt_gather_scope or --vggt_gather_far_gap")
+    if model_args.vggt_token_stats is None:
+        raise ValueError("--use_vggt_token needs --vggt_token_stats (scripts/vggt17/feature_stats.py)")
+    if data_args.vggt_token_source not in VGGT_TOKEN_SOURCES:
+        raise ValueError(f"--vggt_token_source must be one of {VGGT_TOKEN_SOURCES}")
+    if model_args.camera_tokens_mode != "camera_tokens" or model_args.camera_tokens_place not in ("append_to_frame", "prepend_to_frame"):
+        raise ValueError("VGGT tokens need per-frame camera tokens (camera_tokens, append_to_frame/prepend_to_frame)")
+    if not data_args.force_sample or data_args.frames_upbound <= 0:
+        raise ValueError("VGGT features are per uniformly sampled frame: set --force_sample True and --frames_upbound")
+    modules_to_save = [m.strip() for m in (training_args.lora_modules_to_save or "").split(",")]
+    if training_args.lora_enable and "vggt_projector" not in modules_to_save:
+        raise ValueError("with LoRA, add vggt_projector to --lora_modules_to_save (else it is frozen and not saved)")
+
+
 def train(attn_implementation=None):
     global local_rank
 
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    check_vggt_args(model_args, data_args, training_args)
 
     data_args.force_no_bp_vqa = training_args.force_no_bp_vqa
     data_args.camera_tokens_place = model_args.camera_tokens_place
+    data_args.vggt_gather_mode = model_args.vggt_gather_mode
     data_args.enable_camera = model_args.enable_camera
     data_args.enable_point = model_args.enable_point
     data_args.enable_depth = model_args.enable_depth
@@ -2500,7 +2660,7 @@ def train(attn_implementation=None):
     model_args.use_trajectory_balance = data_args.use_trajectory_balance
 
     # assert data_args.load_depth_data
-    
+
     if training_args.verbose_logging:
         rank0_print(f"Inspecting experiment hyperparameters:\n")
         rank0_print(f"model_args = {vars(model_args)}\n\n")
@@ -2510,11 +2670,16 @@ def train(attn_implementation=None):
 
     local_rank = training_args.local_rank
     compute_dtype = torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)
+    if training_args.max_gpu_mem_gb > 0:
+        device = training_args.device
+        total = torch.cuda.get_device_properties(device).total_memory
+        torch.cuda.set_per_process_memory_fraction(min(1.0, training_args.max_gpu_mem_gb * 2**30 / total), device)
+        rank0_print(f"CUDA allocator capped at {training_args.max_gpu_mem_gb} GiB of {total / 2**30:.1f} GiB")
 
     # Set seed before model initialization for reproducibility
     set_seed(training_args.seed)
     rank0_print(f"Set seed to {training_args.seed} before model initialization")
-    
+
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
@@ -2567,21 +2732,35 @@ def train(attn_implementation=None):
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
 
+        if training_args.lora_llm_only:
+            # find_all_linear_names also hits mm_projector / rec_head linears; PEFT 0.4 matches a str with re.fullmatch.
+            target_modules = r"model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
+        else:
+            target_modules = find_all_linear_names(model)
+        modules_to_save = [m.strip() for m in (training_args.lora_modules_to_save or "").split(",") if m.strip()] or None
         lora_config = LoraConfig(
             r=training_args.lora_r,
             lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
+            target_modules=target_modules,
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
+            modules_to_save=modules_to_save,
         )
         if training_args.bits == 16:
             if training_args.bf16:
                 model.to(torch.bfloat16)
             if training_args.fp16:
                 model.to(torch.float16)
+        if model_args.use_vggt_token:
+            init_vggt_projector(model, model_args)
+        if training_args.lora_llm_only:
+            # Same LoRA init with and without the VGGT projector, whose init consumes RNG.
+            set_seed(training_args.seed)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
+    elif model_args.use_vggt_token:
+        init_vggt_projector(model, model_args)
 
     if "mistral" in model_args.model_name_or_path.lower() or "mixtral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
         tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.model_name_or_path, cache_dir=training_args.cache_dir, model_max_length=training_args.model_max_length, padding_side="left")
@@ -2629,13 +2808,13 @@ def train(attn_implementation=None):
             rec_head.depth_head.apply(rec_head._init_weights)
             rank0_print("Re-initialized depth_head weights after from_pretrained")
         rec_head.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
-    
+
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
 
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
-        
+
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
 
@@ -2670,6 +2849,8 @@ def train(attn_implementation=None):
         model.config.faster_token_stride = model_args.faster_token_stride
         model.config.add_time_instruction = data_args.add_time_instruction
         model.config.force_sample = data_args.force_sample
+        if data_args.video_camera_tokens:
+            model.config.use_camera_tokens = True
         model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride 
 
         ### Deciding train which part of the model
@@ -2729,17 +2910,22 @@ def train(attn_implementation=None):
                 for name, param in model.named_parameters():
                     if "rec_head" in name:
                         param.requires_grad_(True)
-            
+
+        if training_args.lora_llm_only:
+            # initialize_vision_modules re-enables mm_projector grads: train only the adapter and modules_to_save.
+            for name, param in model.named_parameters():
+                param.requires_grad = "lora_" in name or "modules_to_save" in name
+
         total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
         trainable_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters() if p.requires_grad)
         rank0_print(f"Total parameters: ~{total_params/1e6:.2f} MB)")
         rank0_print(f"Trainable parameters: ~{trainable_params/1e6:.2f} MB)")
-        
+
         # print all the trainable parameters
         for name, param in model.named_parameters():
             if param.requires_grad:
                 rank0_print(f"Trainable parameter: {name}")
-        
+
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
             model.get_model().rec_head.to(dtype=compute_dtype, device=training_args.device)
@@ -2752,7 +2938,9 @@ def train(attn_implementation=None):
         model.config.cam_mix_mlp_lr = training_args.cam_mix_mlp_lr
         model.config.cam_out_projector_lr = training_args.cam_out_projector_lr
         model.config.downstream_head_lr = training_args.downstream_head_lr
-        
+        model.config.vggt_projector_lr = training_args.vggt_projector_lr
+        model.config.vision_tower_chunk_size = training_args.vision_tower_chunk_size
+
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
@@ -2772,7 +2960,7 @@ def train(attn_implementation=None):
                         module = module.to(torch.bfloat16)
     model.tokenizer = tokenizer
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    
+
     trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
 
     # Clean up incomplete checkpoints before resuming (e.g. from preemption mid-save)
@@ -2822,8 +3010,12 @@ def train(attn_implementation=None):
                 model.config.save_pretrained(training_args.output_dir)
             if hasattr(model, "generation_config"):
                 model.generation_config.save_pretrained(training_args.output_dir)
-            model.save_pretrained(training_args.output_dir, state_dict=state_dict)
-            torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
+            if training_args.lora_llm_only:
+                # PEFT's own state dict: LoRA weights plus modules_to_save (e.g. vggt_projector with its stats buffers).
+                model.save_pretrained(training_args.output_dir)
+            else:
+                model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+                torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, "non_lora_trainables.bin"))
     else:
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 

@@ -336,6 +336,7 @@ class LLaVATrainer(Trainer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._clip_vggt_projector_separately()
         # Build rec_indices from dataset for reordering in sampler
         self._rec_indices = set()
         if self.train_dataset is not None and hasattr(self.train_dataset, 'list_data_dict'):
@@ -346,6 +347,31 @@ class LLaVATrainer(Trainer):
             if self._rec_indices:
                 rank0_print(f"[LLaVATrainer] Found {len(self._rec_indices)} rec samples out of {len(self.train_dataset.list_data_dict)} total. "
                             f"rec_free_tail_ratio={tail_ratio} — last {tail_ratio*100:.0f}% of each epoch will be rec-free.")
+
+    def _clip_vggt_projector_separately(self):
+        """The VGGT projector's gradient norm can be far larger than the LoRA's (10-50x when its token sat near zero, where
+        layer 0's RMSNorm amplifies it by up to 1/sqrt(eps)): a single global clip would rescale the LoRA gradients by a
+        step-dependent factor the control arm does not get. Clip the projector on its own instead; the logged grad_norm is
+        then that of the other parameters (comparable across arms), the projector's is vggt_proj_grad_norm."""
+        self._vggt_proj_grad_norm = None
+        if not getattr(self.args, "vggt_projector_clip_separately", False):
+            return
+        proj = {id(p) for n, p in self.model.named_parameters() if "vggt_projector" in n and p.requires_grad}
+        if not proj:
+            return
+        if self.is_deepspeed_enabled or self.is_fsdp_enabled:
+            rank0_print("[LLaVATrainer] WARNING: vggt_projector_clip_separately is not supported with DeepSpeed/FSDP; using the global clip")
+            return
+        clip = self.accelerator.clip_grad_norm_
+
+        def clip_grad_norm_(parameters, max_norm, norm_type=2):
+            params = list(parameters)
+            norm = clip([p for p in params if id(p) not in proj], max_norm, norm_type=norm_type)  # also unscales all gradients
+            self._vggt_proj_grad_norm = torch.nn.utils.clip_grad_norm_([p for p in params if id(p) in proj], max_norm, norm_type=norm_type)
+            return norm
+
+        self.accelerator.clip_grad_norm_ = clip_grad_norm_
+        rank0_print(f"[LLaVATrainer] Clipping the gradient norm of the {len(proj)} vggt_projector tensors separately")
 
     def create_accelerator_and_postprocess(self):
         grad_acc_kwargs = {"num_steps": self.args.gradient_accumulation_steps}
@@ -550,6 +576,8 @@ class LLaVATrainer(Trainer):
                 lr_mapper["cam_mix_mlp"] = self.args.cam_mix_mlp_lr
             if self.args.cam_out_projector_lr is not None:
                 lr_mapper["cam_out_projector"] = self.args.cam_out_projector_lr
+            if getattr(self.args, "vggt_projector_lr", None) is not None:
+                lr_mapper["vggt_projector"] = self.args.vggt_projector_lr
                 
             if len(lr_mapper) > 0:
                 
@@ -671,7 +699,13 @@ class LLaVATrainer(Trainer):
             logs["loss"] = round(tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged), 4)
             if grad_norm is not None:
                 logs["grad_norm"] = grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            if getattr(self, "_vggt_proj_grad_norm", None) is not None:
+                logs["vggt_proj_grad_norm"] = float(self._vggt_proj_grad_norm)
             logs["learning_rate"] = self._get_learning_rate()
+            if torch.cuda.is_available():
+                logs["peak_mem_gb"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+                logs["peak_reserved_gb"] = round(torch.cuda.max_memory_reserved() / 2**30, 2)
+                torch.cuda.reset_peak_memory_stats()
             
             # Add reconstruction loss metrics to tqdm progress bar
             # Handle both wrapped and unwrapped models

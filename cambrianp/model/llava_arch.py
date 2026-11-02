@@ -30,6 +30,7 @@ from cambrianp.mm_utils import get_anyres_image_grid_shape
 from cambrianp.utils import rank0_print
 
 from cambrianp.model.reconstructor.vggt_reconstructor import VGGTReconstructor
+from cambrianp.model.multimodal_projector.vggt_token import VGGTTokenProjector
 
 import random
 
@@ -44,6 +45,17 @@ class LlavaMetaModel:
         if self.load_rec_model and getattr(self, "rec_head", None) is None:
             self.rec_head = VGGTReconstructor(config)
 
+        # Not in pretrained checkpoints: callers must reset_parameters()/load_stats() or load trained weights after from_pretrained.
+        if getattr(config, "use_vggt_token", False) and getattr(self, "vggt_projector", None) is None:
+            self.vggt_projector = VGGTTokenProjector(
+                getattr(config, "vggt_token_dim", 2048),
+                config.hidden_size,
+                gather_mode=getattr(config, "vggt_gather_mode", "none"),
+                gather_radius=getattr(config, "vggt_gather_radius", 0.15),
+                gather_scope=getattr(config, "vggt_gather_scope", "all"),
+                gather_far_gap=getattr(config, "vggt_gather_far_gap", 32),
+            )
+
         if hasattr(config, "mm_vision_tower"):
             delay_load = getattr(config, "delay_load", False)
             self.vision_tower = build_vision_tower(config, delay_load=delay_load)
@@ -55,7 +67,7 @@ class LlavaMetaModel:
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
 
         self.apply(self._init_weights)
-            
+
     def get_vision_tower(self):
         vision_tower = getattr(self, "vision_tower", None)
         if type(vision_tower) is list:
@@ -151,7 +163,7 @@ class LlavaMetaModel:
                 nn.init.xavier_uniform_(module.out_proj.weight)
                 if module.out_proj.bias is not None:
                     nn.init.zeros_(module.out_proj.bias)
-                    
+
 
 def unpad_image(tensor, original_size):
     """
@@ -218,17 +230,24 @@ class LlavaMetaForCausalLM(ABC):
                 scaled_shape = [side_length, side_length]
             else:
                 scaled_shape = [math.ceil(height / stride), math.ceil(width / stride)]
-            image_feature = nn.functional.interpolate(image_feature, size=scaled_shape, mode="bilinear")
+            # CUDA autocast runs bilinear upsampling in fp32, which would promote the whole LLM input to fp32 under AMP; keep the input dtype
+            image_feature = nn.functional.interpolate(image_feature, size=scaled_shape, mode="bilinear").to(image_feature.dtype)
 
         else:
             raise ValueError(f"Unexpected mm_spatial_pool_mode: {self.config.mm_spatial_pool_mode}")
         image_feature = image_feature.permute(0, 2, 3, 1)
         image_feature = image_feature.view(num_frames, -1, num_dim)
         return image_feature
-    
+
     def encode_images(self, images):
         # llava_features shape: [B*L, num_patches(729), vision_hidden_size(1152)]
-        llava_features = self.get_model().get_vision_tower()(images)
+        vision_tower = self.get_model().get_vision_tower()
+        chunk = getattr(self.config, "vision_tower_chunk_size", 0) or 0
+        if 0 < chunk < images.shape[0]:
+            # Frames are encoded independently; chunking only bounds the transient memory of the tower (~16 GB for 128 frames)
+            llava_features = torch.cat([vision_tower(x) for x in images.split(chunk)])
+        else:
+            llava_features = vision_tower(images)
         image_features = self.get_model().mm_projector(llava_features)  # [32, 729, 1152] -> [32, 729, 896]
         return image_features
 
@@ -255,7 +274,7 @@ class LlavaMetaForCausalLM(ABC):
                 all_videos_or_images_features.append(feat)
             all_faster_video_features.append(faster_video_feature)
         return all_videos_or_images_features, all_faster_video_features
-    
+
     def add_token_per_grid(self, image_feature, feat_size=None):
         if feat_size is not None:
             resize_h, resize_w = feat_size
@@ -289,7 +308,46 @@ class LlavaMetaForCausalLM(ABC):
         image_feature = image_feature.permute(1, 2, 0).contiguous()
         return image_feature
 
-    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, bp_rec=None, bp_vqa=None):
+    def inject_vggt_tokens(self, vggt_feat, num_frames, cur_new_input_embeds, cur_new_labels, info_dict):
+        """Append one projected VGGT token to every frame of the image segment: [img, (CAM,) VGGT] per frame."""
+        if len(cur_new_input_embeds) != 3:
+            raise ValueError("VGGT tokens need exactly one <image> segment and per-frame (or no) camera tokens")
+        if info_dict is not None and info_dict.get("camera_tokens_place") not in ("append_to_frame", "prepend_to_frame"):
+            raise ValueError(f"VGGT tokens are not supported with camera token layout {info_dict.get('camera_tokens_place')}")
+        tokens = vggt_feat["tokens"] if isinstance(vggt_feat, dict) else vggt_feat
+        if tokens.shape[0] != num_frames:
+            raise ValueError(f"got {tokens.shape[0]} VGGT tokens for {num_frames} frames")
+        image_seg = cur_new_input_embeds[1]
+        feat_dim = image_seg.shape[-1]
+        geometry = {k: v.to(image_seg.device) for k, v in vggt_feat.items() if k != "tokens"} if isinstance(vggt_feat, dict) else None
+        visual_features = None
+        if geometry is not None:
+            frame_tokens = image_seg.view(num_frames, -1, feat_dim)
+            if info_dict is not None:
+                frame_tokens = frame_tokens[:, :-1] if info_dict["camera_tokens_place"] == "append_to_frame" else frame_tokens[:, 1:]
+            side = math.isqrt(self.config.mm_img_tok_num)
+            if getattr(self.config, "mm_newline_position", None) != "grid" or frame_tokens.shape[1] != side * (side + 1):
+                raise ValueError("look-at gathering requires the per-frame visual grid with newline tokens")
+            grid = frame_tokens.view(num_frames, side, side + 1, feat_dim)[:, :, :side]
+            lo, hi = int(0.4 * side), math.ceil(0.6 * side)
+            visual_features = grid[:, lo:hi, lo:hi].mean(dim=(1, 2))
+        vggt_tok = (
+            self.get_model()
+            .vggt_projector(
+                tokens.to(image_seg.device),
+                geometry=geometry,
+                visual_features=visual_features,
+            )
+            .to(image_seg.dtype)
+        )
+        image_seg = torch.cat((image_seg.view(num_frames, -1, feat_dim), vggt_tok.unsqueeze(1)), dim=1).view(-1, feat_dim)
+        cur_new_input_embeds[1] = image_seg
+        cur_new_labels[1] = torch.full((image_seg.shape[0],), IGNORE_INDEX, device=cur_new_labels[1].device, dtype=cur_new_labels[1].dtype)
+        if info_dict is not None:
+            info_dict["image_token_length"] = image_seg.shape[0]
+            info_dict["vggt_token_count"] = 1
+
+    def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None, bp_rec=None, bp_vqa=None, vggt_feats=None):
         vision_tower = self.get_vision_tower()
 
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -321,7 +379,7 @@ class LlavaMetaForCausalLM(ABC):
 
             encoded_image_features = self.encode_images(concat_images)
             # This is a list, each element is [num_images, patch * patch, dim] [32, 729, 896]
-            
+
             feat_size = None
             encoded_image_features = torch.split(encoded_image_features, split_sizes)
             image_features = []
@@ -331,7 +389,7 @@ class LlavaMetaForCausalLM(ABC):
                         image_feat, stride=self.config.mm_spatial_pool_stride,
                         target_side_length=self.config.mm_img_tok_num
                     )
-                    
+
                     if getattr(self.config, "unpad_image", False):
                         feat_side_length = int(math.sqrt(image_feat.shape[1]))
                         num_frames = image_feat.shape[0]
@@ -340,7 +398,7 @@ class LlavaMetaForCausalLM(ABC):
                         image_feat = unpad_image(image_feat, image_sizes)
                         feat_size = image_feat.shape[1:3]
                         image_feat = image_feat.flatten(1, 2)
-                    
+
                     image_features.append(image_feat)
                 else:
                     image_features.append(image_feat)
@@ -518,14 +576,14 @@ class LlavaMetaForCausalLM(ABC):
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
             cur_input_ids_noim = []
             cur_labels_noim = []
-            
+
             cam_segment_idx = -1
             cam_position_in_segment = -1
-            
+
             for i in range(len(image_token_indices) - 1):
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i] + 1 : image_token_indices[i + 1]])
                 cur_labels_noim.append(cur_labels[image_token_indices[i] + 1 : image_token_indices[i + 1]])
-            
+
             split_sizes = [x.shape[0] for x in cur_labels_noim]
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
 
@@ -535,7 +593,7 @@ class LlavaMetaForCausalLM(ABC):
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
             cur_new_input_embeds = []
             cur_new_labels = []
-            
+
             for i in range(num_images + 1):
                 seg_labels = cur_labels_noim[i]
                 seg_embeds = cur_input_embeds_no_im[i]
@@ -565,7 +623,10 @@ class LlavaMetaForCausalLM(ABC):
                     cam_segment_idx=cam_segment_idx,
                     cam_position_in_segment=cam_position_in_segment
                 )
- 
+
+            if vggt_feats is not None and vggt_feats[batch_idx] is not None:
+                self.inject_vggt_tokens(vggt_feats[batch_idx], images[batch_idx].shape[0], cur_new_input_embeds, cur_new_labels, info_dict)
+
             info_dict_list.append(info_dict)
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
@@ -635,7 +696,7 @@ class LlavaMetaForCausalLM(ABC):
             position_ids[:, split_position:] += right_add
 
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, info_dict_list
-    
+
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)

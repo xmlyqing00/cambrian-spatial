@@ -38,6 +38,14 @@ REC_DIR_PATTERNS = (
 )
 
 
+def video_scene_key(video_path):
+    """Keep alternate ScanNet scans of one room together, including across train/validation."""
+    source = osp.basename(osp.dirname(osp.normpath(video_path)))
+    source = "scannetpp" if source == "scannetppv2" else source
+    stem = osp.splitext(osp.basename(video_path))[0]
+    return source, stem.rsplit("_", 1)[0] if source == "scannet" else stem
+
+
 def check_video_loading_type(video_file: str, loading_type: str = None) -> str:
     """
     Infer how `video_file` should be interpreted for loading.
@@ -235,9 +243,11 @@ def process_video_frames(
     video: Optional[List[Image.Image]],
     rec_views: Optional[dict],
     is_real_vqa: bool,
+    pad_to_square: bool = False,
 ) -> Tuple[torch.Tensor, Tuple[int, int], List[Tuple]]:
     """
     Process video frames for VLM input using image processor.
+    pad_to_square: pad each frame to square with the processor's image mean first, as the lmms-eval wrapper does.
     
     Returns:
         (processed_frames, original_size, image_payload)
@@ -245,6 +255,12 @@ def process_video_frames(
     image_payload is [(processed_frames, original_size, "video")]
     """
     frames_pil, original_size = get_video_frames_for_vlm(video, rec_views, is_real_vqa)
+
+    if pad_to_square:
+        from cambrianp.mm_utils import expand2square
+
+        background = tuple(int(x * 255) for x in processor.image_mean)
+        frames_pil = [expand2square(f if isinstance(f, Image.Image) else Image.fromarray(f, mode="RGB"), background) for f in frames_pil]
     
     processed_frames = processor.preprocess(
         frames_pil, return_tensors="pt"

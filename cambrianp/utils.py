@@ -404,7 +404,20 @@ def pretty_print_semaphore(semaphore):
     return f"Semaphore(value={semaphore._value}, locked={semaphore.locked()})"
 
 
+def is_cambrian_s_style_config(config):
+    """Cambrian-S checkpoints (CambrianQwenForCausalLM + mm_vision_tower_aux_list) need casting;
+    checkpoints saved by this codebase (e.g. released Cambrian-P) are already LLaVA-OV style."""
+    architectures = getattr(config, "architectures", None) or []
+    return bool(getattr(config, "mm_vision_tower_aux_list", None)) or any("cambrian" in arch.lower() for arch in architectures)
+
+
 def cast_cambrian_config_to_llava_ov_style(config, model_path):
+    # Re-casting an already-converted config would overwrite its trained vocab_size (embedding shape
+    # mismatch on load) and delete the camera/rec_head keys (load_rec_model, rec_*, token_num, ...).
+    if not is_cambrian_s_style_config(config):
+        rank0_print(f"[cambrian-cast] {model_path} is already LLaVA-OV style; skipping cast")
+        return config
+
     # load the corresponding llava-ov config
     
     from cambrianp.model.language_model.llava_qwen import LlavaQwenConfig

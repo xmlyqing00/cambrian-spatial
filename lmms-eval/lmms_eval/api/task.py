@@ -849,6 +849,15 @@ class ConfigurableTask(Task):
 
     @retry(stop=(stop_after_attempt(5) | stop_after_delay(60)), wait=wait_fixed(2))
     def download(self, dataset_kwargs=None) -> None:
+        cached_arrow = os.getenv("VSI_BENCH_ARROW")
+        if cached_arrow and self.DATASET_PATH == "nyu-visionx/VSI-Bench":
+            dataset = datasets.Dataset.from_file(cached_arrow)
+            if self.config.process_docs is not None:
+                dataset = self.config.process_docs(dataset)
+            self.dataset = datasets.DatasetDict({self.config.test_split: dataset})
+            self.dataset_no_image = self.dataset.copy()
+            return
+
         dataset_kwargs = dict(dataset_kwargs or {})
         hf_token_source = _resolve_hf_token_source(dataset_kwargs)
         hf_token = _resolve_hf_token(dataset_kwargs)
