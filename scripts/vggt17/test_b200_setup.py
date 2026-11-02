@@ -15,24 +15,31 @@ import sys
 
 args = sys.argv[1:]
 with open(os.environ["COMMAND_LOG"], "a") as handle:
-    handle.write(json.dumps({"args": args, "ds_build_ops": os.environ.get("DS_BUILD_OPS")}) + "\n")
+    handle.write(json.dumps({"args": args, "ds_build_ops": os.environ.get("DS_BUILD_OPS"), "ds_accelerator": os.environ.get("DS_ACCELERATOR")}) + "\n")
 ready = Path(os.environ["UV_READY"])
 if args == ["-m", "uv", "--version"]:
     sys.exit(0 if ready.exists() else 1)
 if args[:3] == ["-m", "pip", "install"]:
     ready.touch()
-elif args[:3] == ["-m", "uv", "venv"]:
+elif args[:1] == ["-c"] and "find_uv_bin" in args[1]:
+    print(Path(__file__).resolve())
+elif args[:1] == ["venv"]:
     target = Path(args[-1]) / "bin/python"
     target.parent.mkdir(parents=True)
     shutil.copyfile(__file__, target)
     target.chmod(0o755)
+elif args == ["-B", "-"]:
+    program = sys.stdin.read()
+    if "Python.h" in program and os.environ.get("MISSING_PYTHON_HEADERS") == "1":
+        print("Python.h missing in the existing interpreter", file=sys.stderr)
+        sys.exit(1)
 elif args == ["-"]:
     print("https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp310-cp310-linux_x86_64.whl")
 """
 
 
 class B200SetupTests(unittest.TestCase):
-    def run_setup(self, root, existing=False):
+    def run_setup(self, root, existing=False, missing_headers=False):
         executable = root / "bootstrap"
         executable.write_text(f"#!{sys.executable}\n" + FAKE_PYTHON)
         executable.chmod(0o755)
@@ -45,18 +52,23 @@ class B200SetupTests(unittest.TestCase):
             python.write_text(executable.read_text())
             python.chmod(0o755)
         logfile = root / "commands.jsonl"
-        env = dict(os.environ, BOOTSTRAP_PYTHON=str(executable), COMMAND_LOG=str(logfile), UV_READY=str(ready))
+        env = dict(os.environ, BOOTSTRAP_PYTHON=str(executable), COMMAND_LOG=str(logfile), UV_READY=str(ready), DS_ACCELERATOR="cuda")
+        if missing_headers:
+            env["MISSING_PYTHON_HEADERS"] = "1"
         script = Path(__file__).with_name("setup_b200.sh")
         subprocess.run(["bash", str(script), str(prefix)], env=env, check=True, capture_output=True, text=True)
         return [json.loads(line) for line in logfile.read_text().splitlines()], prefix, executable
 
     def test_pip_bootstraps_uv_and_uv_targets_the_b200_environment(self):
         with tempfile.TemporaryDirectory() as name:
-            commands, prefix, executable = self.run_setup(Path(name))
+            commands, prefix, _ = self.run_setup(Path(name))
             args = [command["args"] for command in commands]
             self.assertIn(["-m", "pip", "install", "--user", "--upgrade", "uv"], args)
-            self.assertIn(["-m", "uv", "venv", "--python", str(executable), "--seed", str(prefix)], args)
-            installs = [command for command in commands if command["args"][:4] == ["-m", "uv", "pip", "install"]]
+            self.assertIn(["venv", "--python", "3.10", "--managed-python", "--seed", str(prefix)], args)
+            uninstall = ["pip", "uninstall", "--python", str(prefix / "bin/python"), "deepspeed"]
+            self.assertIn(uninstall, args)
+            self.assertLess(args.index(uninstall), next(i for i, options in enumerate(args) if options[:2] == ["pip", "install"]))
+            installs = [command for command in commands if command["args"][:2] == ["pip", "install"]]
             self.assertEqual(len(installs), 5)
             for command in installs:
                 options = command["args"]
@@ -66,14 +78,26 @@ class B200SetupTests(unittest.TestCase):
             for options in cuda_installs:
                 self.assertEqual(options[options.index("--torch-backend") + 1], "cu128")
             requirements = next(command for command in installs if "-r" in command["args"])
-            self.assertEqual(requirements["ds_build_ops"], "0")
+            self.assertEqual(requirements["ds_accelerator"], "cuda")
             self.assertIn("--no-build-isolation", requirements["args"])
+            preflight = next(command for command in reversed(commands) if command["args"] == ["-B", "-"])
+            self.assertEqual(preflight["ds_accelerator"], "cuda")
 
     def test_existing_uv_and_environment_are_reused(self):
         with tempfile.TemporaryDirectory() as name:
             commands, _, _ = self.run_setup(Path(name), existing=True)
             self.assertFalse(any(command["args"][:3] == ["-m", "pip", "install"] for command in commands))
-            self.assertFalse(any(command["args"][:3] == ["-m", "uv", "venv"] for command in commands))
+            self.assertFalse(any(command["args"][:1] == ["venv"] for command in commands))
+
+    def test_missing_python_headers_fail_before_installing_dependencies(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            with self.assertRaises(subprocess.CalledProcessError) as failure:
+                self.run_setup(root, existing=True, missing_headers=True)
+            self.assertIn("Python.h", failure.exception.stderr)
+            commands = [json.loads(line) for line in (root / "commands.jsonl").read_text().splitlines()]
+            self.assertFalse(any(command["args"][:1] == ["pip"] for command in commands))
+            self.assertFalse(any(command["args"][:1] == ["venv"] for command in commands))
 
 
 if __name__ == "__main__":

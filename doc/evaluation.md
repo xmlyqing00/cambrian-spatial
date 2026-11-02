@@ -34,6 +34,8 @@ export CAMBRIANP_CKPT=$PWD/ckpts/Cambrian-P-7B
 
 Cambrian-P is evaluated on 10 spatial-reasoning and general video benchmarks (paper Section 4.1): VSI-Bench, VSI-TemporalI-Bench, SparBench, MMSIBench, MMSIVideo, MindCube, Tomato, MVBench, EgoSchema, and Perception Test.
 
+Benchmark data is fetched from Hugging Face on first run (e.g. VSI-Bench from `nyu-visionx/VSI-Bench`, videos extracted to `$HF_HOME/vsibench`, default `~/.cache/huggingface/vsibench`); the training set VSI-590K is not needed for evaluation.
+
 ```bash
 NUM_FRAMES=128   # Cambrian-P-7B (default) and -Mix-CamS; 64 for -Mix-MA; 32 for -32f / -Mix-3R
 

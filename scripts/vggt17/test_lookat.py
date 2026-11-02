@@ -1,11 +1,13 @@
 """Look-at regression tests, including an optional CUDA precision check: python -m unittest scripts.vggt17.test_lookat -v."""
 
+import builtins
 import copy
+import importlib.util
 import os
 import tempfile
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -77,6 +79,63 @@ def mixed_ddp_worker(rank, store):
 
 
 class LookAtTests(unittest.TestCase):
+    def test_nonzero_checkpointing_does_not_require_deepspeed(self):
+        original_import = builtins.__import__
+        original_spec = importlib.util.find_spec
+
+        def without_deepspeed(name, *args, **kwargs):
+            if name == "deepspeed" or name.startswith("deepspeed."):
+                raise AssertionError(f"Unexpected DeepSpeed import: {name}")
+            return original_import(name, *args, **kwargs)
+
+        def find_spec(name, *args, **kwargs):
+            return None if name == "deepspeed" else original_spec(name, *args, **kwargs)
+
+        with patch("builtins.__import__", without_deepspeed), patch("importlib.util.find_spec", find_spec):
+            from accelerate import Accelerator
+            from cambrianp.train import train, llava_trainer
+
+            accelerator = Accelerator(cpu=True)
+            model = torch.nn.Linear(4, 4)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+            initial = model.weight.detach().clone()
+            model, optimizer = accelerator.prepare(model, optimizer)
+            accelerator.backward(model(torch.ones(2, 4)).square().mean())
+            optimizer.step()
+            param = accelerator.unwrap_model(model).weight
+            self.assertFalse(torch.equal(param, initial))
+            states = [
+                train.maybe_zero_3(param),
+                llava_trainer.maybe_zero_3(param),
+                train.get_peft_state_maybe_zero_3([("model.lora_A.weight", param)], "none")["model.lora_A.weight"],
+                train.get_peft_state_non_lora_maybe_zero_3([("model.vggt_projector.weight", param)])["model.vggt_projector.weight"],
+                llava_trainer.get_mm_adapter_state_maybe_zero_3([("model.mm_projector.weight", param)], ["mm_projector"])["model.mm_projector.weight"],
+            ]
+            for state in states:
+                torch.testing.assert_close(state, param.detach())
+                self.assertEqual(state.device.type, "cpu")
+                self.assertFalse(state.requires_grad)
+                self.assertNotEqual(state.data_ptr(), param.data_ptr())
+
+    def test_zero3_checkpointing_still_gathers_partitioned_parameters(self):
+        from cambrianp.train import train, llava_trainer
+
+        deepspeed = ModuleType("deepspeed")
+        gathered = MagicMock()
+        deepspeed.zero = SimpleNamespace(GatheredParameters=gathered)
+        partition = ModuleType("deepspeed.runtime.zero.partition_parameters")
+        partition.ZeroParamStatus = SimpleNamespace(NOT_AVAILABLE=1)
+        param = torch.nn.Parameter(torch.ones(4))
+        param.ds_id, param.ds_status = 0, partition.ZeroParamStatus.NOT_AVAILABLE
+        with patch.dict("sys.modules", {"deepspeed": deepspeed, partition.__name__: partition}):
+            for clone in (train.maybe_zero_3, llava_trainer.maybe_zero_3):
+                gathered.reset_mock()
+                state = clone(param, ignore_status=True)
+                gathered.assert_called_once_with([param])
+                gathered.return_value.__enter__.assert_called_once()
+                torch.testing.assert_close(state, param.detach())
+                self.assertFalse(state.requires_grad)
+
     def test_ddp_handles_image_only_and_video_ranks_with_checkpointing(self):
         with tempfile.TemporaryDirectory() as tmp:
             torch.multiprocessing.spawn(mixed_ddp_worker, args=(os.path.join(tmp, "store"),), nprocs=2)

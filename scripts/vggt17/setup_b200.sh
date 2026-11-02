@@ -9,14 +9,36 @@ bootstrap=${BOOTSTRAP_PYTHON:-/usr/bin/python3}
 if ! "$bootstrap" -m uv --version >/dev/null 2>&1; then
     "$bootstrap" -m pip install --user --upgrade uv
 fi
+# Native uv can select a managed Python without inheriting the bootstrap interpreter.
+uv=$("$bootstrap" -c 'from uv import find_uv_bin; print(find_uv_bin())')
 if [ ! -x "$prefix/bin/python" ]; then
-    "$bootstrap" -m uv venv --python "$bootstrap" --seed "$prefix"
+    "$uv" venv --python 3.10 --managed-python --seed "$prefix"
 fi
 py="$prefix/bin/python"
-"$bootstrap" -m uv pip install --python "$py" --upgrade pip 'setuptools<81' wheel packaging ninja
-"$bootstrap" -m uv pip install --python "$py" --torch-backend cu128 torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
-DS_BUILD_OPS=0 "$bootstrap" -m uv pip install --python "$py" --no-build-isolation --torch-backend cu128 -r scripts/vggt17/requirements_b200.txt
-"$bootstrap" -m uv pip install --python "$py" --no-deps --no-build-isolation -e . -e ./vggt
+"$py" -B - <<'PY'
+from pathlib import Path
+import shlex
+import sys
+import sysconfig
+
+include = Path(sysconfig.get_path("include"))
+missing = [name for name in ("Python.h", "pyconfig.h") if not (include / name).is_file()]
+if missing:
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    command = f'uv venv --allow-existing --python "$(uv python find --system --managed-python {version})" {shlex.quote(sys.prefix)}'
+    raise SystemExit(
+        f"Python development headers missing under {include}: {', '.join(missing)}.\n"
+        f"Triton needs these headers even without a CUDA toolkit. Install a managed Python and rebase this environment without deleting packages:\n"
+        f"uv python install --no-bin {version}\n{command}"
+    )
+print("Python development headers:", include)
+PY
+# Accelerate imports installed DeepSpeed even in plain DDP.
+"$uv" pip uninstall --python "$py" deepspeed
+"$uv" pip install --python "$py" --upgrade pip 'setuptools<81' wheel packaging ninja
+"$uv" pip install --python "$py" --torch-backend cu128 torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1
+"$uv" pip install --python "$py" --no-build-isolation --torch-backend cu128 -r scripts/vggt17/requirements_b200.txt
+"$uv" pip install --python "$py" --no-deps --no-build-isolation -e . -e ./vggt
 wheel=$("$py" - <<'PY'
 import sys
 import torch
@@ -26,8 +48,11 @@ abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
 print(f"https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abi{abi}-{tag}-{tag}-linux_x86_64.whl")
 PY
 )
-"$bootstrap" -m uv pip install --python "$py" --no-deps "$wheel"
+"$uv" pip install --python "$py" --no-deps "$wheel"
 PYTHONPATH="$PWD/lmms-eval:$PWD${PYTHONPATH:+:$PYTHONPATH}" LMMS_EVAL_LAUNCHER=python PYTHONDONTWRITEBYTECODE=1 "$py" -B - <<'PY'
+from importlib.util import find_spec
+
+assert find_spec("deepspeed") is None, "This recipe uses CUDA DDP; DeepSpeed must not be installed in this environment"
 import torch
 from flash_attn import flash_attn_func
 from cambrianp.train.train import TrainingArguments
@@ -46,6 +71,6 @@ for device in range(2):
         torch.cuda.synchronize()
         assert q.grad is not None and torch.isfinite(q.grad).all()
         print(device, torch.cuda.get_device_name(device), "BF16 FlashAttention forward/backward passed")
-print("Training/evaluation imports passed:", torch.__version__, datasets.__version__, pyarrow.__version__)
+print("Training/evaluation imports passed (CUDA DDP, no DeepSpeed):", torch.__version__, datasets.__version__, pyarrow.__version__)
 PY
 printf '\nEnvironment ready: %s\n' "$prefix"

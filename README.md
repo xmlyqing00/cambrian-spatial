@@ -122,6 +122,9 @@ pip install torch==2.4.1+cu121 torchvision==0.19.1+cu121 torchaudio==2.4.1+cu121
     --index-url https://download.pytorch.org/whl/cu121
 pip install --no-deps https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
 pip install accelerate==0.29.3 easydict matplotlib roma evo imageio OpenEXR
+
+# Evaluation (lmms-eval runtime deps; pyarrow pinned to stay compatible with NumPy 1.26)
+pip install loguru tenacity==8.3.0 pytz pytablewriter sacrebleu evaluate sqlitedict==2.1.0 pyarrow==17.0.0
 ```
 
 See [`doc/env_install.md`](doc/env_install.md) for the detailed version.

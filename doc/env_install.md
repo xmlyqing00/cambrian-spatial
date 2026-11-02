@@ -30,3 +30,10 @@ pip install roma evo imageio
 pip install OpenEXR
 ```
 
+## 5. **install evaluation deps**
+lmms-eval is used from source via `PYTHONPATH` (see [evaluation.md](evaluation.md)). Don't `pip install -e lmms-eval`: its pins (protobuf, transformers, httpx) conflict with this env. Install only its runtime deps:
+```bash
+pip install loguru tenacity==8.3.0 pytz pytablewriter sacrebleu evaluate sqlitedict==2.1.0 pyarrow==17.0.0
+```
+`pyarrow` is pinned because recent releases require NumPy 2, while this env uses NumPy 1.26 (`import datasets` fails otherwise).
+

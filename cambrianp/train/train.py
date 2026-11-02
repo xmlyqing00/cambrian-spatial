@@ -35,7 +35,6 @@ import re
 import torch
 import transformers
 import tokenizers
-import deepspeed
 
 from transformers import AutoConfig, set_seed
 from torch.utils.data import Dataset
@@ -460,10 +459,10 @@ class TrainingArguments(transformers.TrainingArguments):
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
-    from deepspeed import zero
-    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-
     if hasattr(param, "ds_id"):
+        from deepspeed import zero
+        from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
         if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
             if not ignore_status:
                 logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
@@ -2514,6 +2513,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 low_cpu_mem_usage=False,
                 **customized_kwargs,
             )
+            import deepspeed
             from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 
             deepspeed.utils.set_z3_leaf_modules(model, [MixtralSparseMoeBlock])
@@ -2554,6 +2554,7 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                     low_cpu_mem_usage=False,
                     **customized_kwargs,
                 )
+                import deepspeed
                 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
 
                 deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
