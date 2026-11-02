@@ -16,7 +16,7 @@ from cambrianp.constants import IGNORE_INDEX
 from cambrianp.datasets.vqa_dataloading_utils import video_scene_key
 from cambrianp.model.language_model.llava_qwen import LlavaQwenConfig, LlavaQwenForCausalLM
 from cambrianp.model.llava_arch import LlavaMetaForCausalLM
-from cambrianp.model.multimodal_projector.vggt_token import VGGTFeatureError, VGGTTokenProjector, check_vggt_features, load_vggt_tokens, lookat_weights
+from cambrianp.model.multimodal_projector.vggt_token import VGGTFeatureError, VGGTTokenProjector, check_vggt_features, load_vggt_tokens, lookat_weights, vggt_feature_path
 from cambrianp.model.reconstructor.vggt_reconstructor import VGGTReconstructor
 from scripts.vggt17 import precompute_vggt
 from scripts.vggt17.build_train_manifest import split_samples
@@ -285,6 +285,57 @@ class LookAtTests(unittest.TestCase):
                 load_vggt_tokens(path, frame_idx=data["anchors"] + 1, gather_mode="lookat")
             with self.assertRaises(VGGTFeatureError):
                 check_vggt_features(path, gather_mode="lookat", num_anchors=n + 1)
+
+    def test_nested_video_caches_match_precompute_preflight_and_training(self):
+        from cambrianp.train.train import LazySupervisedDataset
+
+        anchors, stride, bounds, segments, group_idx, valid = precompute_vggt.plan(1000, 30, [])
+        features = dict(
+            anchors=anchors,
+            stride=stride,
+            n_frames=1000,
+            fps=30,
+            seg_bounds=bounds,
+            seg_id=segments,
+            group_idx=group_idx,
+            group_valid=valid,
+            group_tok=np.ones((128, 17, 4), np.float16),
+            group_pose=np.zeros((128, 17, 9), np.float32),
+            scene_pose=np.zeros((128, 9), np.float32),
+            scene_lookat=np.ones((128, 3), np.float32),
+            scene_long_side=448,
+        )
+        features["scene_pose"][:, 6:] = 1
+        videos = ["procthor/000550/raw_navigation_camera__0.mp4", "procthor/000551/raw_navigation_camera__0.mp4", "s3dis/area_6/Area_6_office_6.mp4", "scannet/scene0101_03.mp4"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root, cache = os.path.join(tmp, "videos"), os.path.join(tmp, "features")
+            argv = ["precompute", "--root", root, "--out", cache, "--videos", *videos]
+            with patch("sys.argv", argv), patch.object(precompute_vggt, "process", return_value=features), patch.object(precompute_vggt.VGGT, "from_pretrained"), patch("torch.cuda.reset_peak_memory_stats"), patch(
+                "torch.cuda.max_memory_allocated", return_value=0
+            ):
+                precompute_vggt.main()
+            dataset = SimpleNamespace(
+                data_path=root,
+                list_data_dict=[{"video": video} for video in videos],
+                data_args=SimpleNamespace(vggt_feat_dir=cache, vggt_token_source="group", vggt_gather_mode="lookat", frames_upbound=128, force_sample=True),
+            )
+            LazySupervisedDataset._check_vggt_feats(dataset)
+            for i, video in enumerate(videos):
+                absolute = os.path.join(root, video)
+                relative_cache = vggt_feature_path(cache, video)
+                self.assertEqual(relative_cache, vggt_feature_path(cache, absolute, video_root=root))
+                check_vggt_features(relative_cache, "group", "lookat", 128)
+                loaded = LazySupervisedDataset._load_vggt_feats(dataset, i, absolute, "video_file", SimpleNamespace(video_time=1000 / 30), 128)
+                torch.testing.assert_close(loaded["tokens"], torch.from_numpy(features["group_tok"][:, 0]))
+                self.assertTrue(loaded["valid"].all())
+                dataset.data_path = os.path.relpath(root)
+                relative_loaded = LazySupervisedDataset._load_vggt_feats(dataset, i, os.path.join(dataset.data_path, video), "video_file", SimpleNamespace(video_time=1000 / 30), 128)
+                torch.testing.assert_close(relative_loaded["tokens"], loaded["tokens"])
+                dataset.data_path = root
+            absolute_benchmark = os.path.join(root, videos[-1])
+            np.testing.assert_array_equal(load_vggt_tokens(vggt_feature_path(cache, absolute_benchmark)), features["group_tok"][:, 0])
+            with self.assertRaisesRegex(VGGTFeatureError, "outside"):
+                vggt_feature_path(cache, absolute_benchmark, video_root=os.path.join(tmp, "other"))
 
     def test_split_keeps_rooms_and_all_answer_turns_together(self):
         rows = []

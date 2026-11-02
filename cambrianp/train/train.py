@@ -379,7 +379,7 @@ class DataArguments:
                   "Example: --vlm_filter_categories_to_exclude text_overlay,synthetic,screen_recording"}
     )
 
-    vggt_feat_dir: Optional[str] = field(default=None, metadata={"help": "Precomputed VGGT-17 features, <dir>/<video dir>/<video stem>.npz"})
+    vggt_feat_dir: Optional[str] = field(default=None, metadata={"help": "Precomputed VGGT-17 features, preserving each video's path relative to data_path with a .npz extension"})
     vggt_token_source: str = field(default="group", metadata={"help": "'group' (anchor of its 17-frame pass) or 'scene'"})
     video_camera_tokens: bool = field(default=False, metadata={"help": "Camera tokens in VQA-only video samples, as at eval (no pose loss without rec views)"})
     video_pad_to_square: bool = field(default=False, metadata={"help": "Pad video frames to square with the image mean, as the lmms-eval wrapper does"})
@@ -2144,7 +2144,7 @@ class LazySupervisedDataset(Dataset):
         if loading_type != "video_file" or not self.data_args.force_sample or any(k in item for k in ("start_frame", "start")):
             raise ValueError(f"VGGT tokens need whole-video uniform sampling (video file, force_sample, no clip bounds): {video_file}")
         tokens = load_vggt_tokens(
-            vggt_feature_path(self.data_args.vggt_feat_dir, video_file),
+            vggt_feature_path(self.data_args.vggt_feat_dir, item["video"], video_root=self.data_path),
             self.data_args.vggt_token_source,
             video_time=clip_info.video_time,
             gather_mode=getattr(self.data_args, "vggt_gather_mode", "none"),
@@ -2159,14 +2159,14 @@ class LazySupervisedDataset(Dataset):
     def _check_vggt_feats(self):
         """Fail before training rather than have __getitem__ silently swap in other samples."""
         videos = {e["video"] for e in self.list_data_dict if "video" in e}
-        missing = sorted(v for v in videos if not os.path.exists(vggt_feature_path(self.data_args.vggt_feat_dir, os.path.join(self.data_path, v))))
+        missing = sorted(v for v in videos if not os.path.exists(vggt_feature_path(self.data_args.vggt_feat_dir, v, video_root=self.data_path)))
         if missing:
             raise FileNotFoundError(f"{len(missing)}/{len(videos)} videos have no VGGT features in {self.data_args.vggt_feat_dir}, e.g. {missing[:3]}")
         invalid = []
         for video in sorted(videos):
             try:
                 check_vggt_features(
-                    vggt_feature_path(self.data_args.vggt_feat_dir, video),
+                    vggt_feature_path(self.data_args.vggt_feat_dir, video, video_root=self.data_path),
                     self.data_args.vggt_token_source,
                     getattr(self.data_args, "vggt_gather_mode", "none"),
                     self.data_args.frames_upbound,

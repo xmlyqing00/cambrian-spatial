@@ -18,11 +18,20 @@ class VGGTFeatureError(ValueError):
     pass
 
 
-def vggt_feature_path(feat_dir, video_path):
-    """<feat_dir>/<video parent dir>/<video stem>.npz, e.g. .../scannet/scene0011_00.mp4 -> <feat_dir>/scannet/scene0011_00.npz"""
-    parent = os.path.basename(os.path.dirname(os.path.normpath(video_path)))
-    stem = os.path.splitext(os.path.basename(video_path))[0]
-    return os.path.join(feat_dir, parent, stem + ".npz")
+def vggt_feature_path(feat_dir, video_path, video_root=None):
+    """Preserve dataset-relative subfolders; video_root resolves absolute video paths.
+
+    Without a root, absolute paths retain the legacy parent/stem lookup used by flat benchmark caches.
+    """
+    video_path = os.path.normpath(video_path)
+    if os.path.isabs(video_path):
+        if video_root is not None:
+            video_path = os.path.relpath(video_path, video_root)
+        else:
+            video_path = os.path.join(os.path.basename(os.path.dirname(video_path)), os.path.basename(video_path))
+    if video_path == os.pardir or video_path.startswith(os.pardir + os.sep):
+        raise VGGTFeatureError(f"{video_path}: video path is outside the dataset root")
+    return os.path.join(feat_dir, os.path.splitext(video_path)[0] + ".npz")
 
 
 def _check_metadata(z, npz_path, source, gather_mode, num_anchors=None):

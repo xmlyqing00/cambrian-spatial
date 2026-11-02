@@ -128,7 +128,7 @@ def main():
         pix_diff = (pixels - eval_pixels).abs().max().item()
         assert pix_diff == 0, f"{i}: pixels differ from eval by {pix_diff}"
 
-        eval_features = load_vggt_tokens(vggt_feature_path(a.vggt_feat_dir, video), "group", frame_idx=frame_idx, gather_mode=a.gather_mode)
+        eval_features = load_vggt_tokens(vggt_feature_path(a.vggt_feat_dir, video, video_root=a.data_path), "group", frame_idx=frame_idx, gather_mode=a.gather_mode)
         if isinstance(eval_features, dict):
             for key, value in eval_features.items():
                 torch.testing.assert_close(item["vggt_feats"][key], torch.from_numpy(value), rtol=0, atol=0, equal_nan=True, msg=f"{i}: {key} differs from eval")
