@@ -27,4 +27,10 @@ accelerate launch --num_processes=1 --main_process_port "$port" -m lmms_eval --m
   --output_path "$out/$tag" "${limit_arg[@]}" > "output/vggt17/logs/eval_$tag.log" 2>&1
 rc=$?
 # lmms-eval exits 0 even on errors (e.g. OOM); success = results.json written
-if find "$out/$tag" -name results.json 2>/dev/null | grep -q .; then echo "EVAL $tag OK (exit $rc)"; else echo "EVAL $tag FAILED (exit $rc, no results.json)"; fi
+if [ "$rc" -eq 0 ] && find "$out/$tag" -name results.json 2>/dev/null | grep -q .; then
+    echo "EVAL $tag OK (exit $rc)"
+else
+    echo "EVAL $tag FAILED (exit $rc; require a successful launch and results.json)" >&2
+    [ "$rc" -ne 0 ] || rc=1
+    exit "$rc"
+fi

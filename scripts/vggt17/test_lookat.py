@@ -199,6 +199,27 @@ class LookAtTests(unittest.TestCase):
         p.gather_scope = "self"
         torch.testing.assert_close(p(x, geometry=g, visual_features=visual), p.mlp(x), atol=0, rtol=0)
 
+    def test_training_logs_consume_video_diagnostics_without_stale_image_metrics(self):
+        from cambrianp.train.llava_trainer import LLaVATrainer
+
+        model = torch.nn.Module()
+        model.vggt_projector = torch.nn.ModuleDict({"original_module": VGGTTokenProjector(4, 8, gather_mode="lookat"), "modules_to_save": torch.nn.ModuleDict({"default": VGGTTokenProjector(4, 8, gather_mode="lookat", gather_far_gap=3)})})
+        projector = model.vggt_projector["modules_to_save"]["default"]
+        projector.reset_parameters()
+        projector(torch.randn(5, 4), geometry([[0, 0, 2]] * 5), torch.randn(5, 8))
+        trainer = SimpleNamespace(model=model)
+        logs = LLaVATrainer._get_vggt_gather_logs(trainer)
+        self.assertGreater(logs["vggt_far_neighbors"], 0)
+        self.assertGreater(logs["vggt_near_neighbors"], 0)
+        self.assertAlmostEqual(logs["vggt_gate"], 0.1)
+        self.assertAlmostEqual(logs["vggt_visual_gate"], 0.1)
+        self.assertEqual(LLaVATrainer._get_vggt_gather_logs(trainer), {})
+        projector.gather_scope = "self"
+        projector(torch.randn(5, 4), geometry([[0, 0, 2]] * 5), torch.randn(5, 8))
+        logs = LLaVATrainer._get_vggt_gather_logs(trainer)
+        self.assertEqual(logs["vggt_neighbors"], 0)
+        self.assertEqual(logs["vggt_far_neighbors"], 0)
+
     def test_low_memory_checkpoint_loading_initializes_new_gatherer(self):
         config = LlavaQwenConfig(vocab_size=23, hidden_size=8, intermediate_size=16, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2)
         with tempfile.TemporaryDirectory() as tmp:

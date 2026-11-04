@@ -82,9 +82,13 @@ expected = json.loads(metadata.read_text())["evaluation"]["qas"]
 results = list(root.rglob("results*.json"))
 assert results, f"No results written under {root}"
 assert any("vsibench" in json.loads(path.read_text()).get("results", {}) for path in results), "Missing VSI-Bench metrics"
-sample_files = list(root.rglob("samples_vsibench_*.jsonl"))
+sample_files = list(root.rglob("samples_vsibench_*.jsonl")) + list(root.rglob("vsibench.json"))
 assert len(sample_files) == 1, f"Expected one fresh sample log, found {sample_files}"
-rows = [json.loads(line) for line in sample_files[0].open() if line.strip()]
+sample_file = sample_files[0]
+if sample_file.suffix == ".jsonl":
+    rows = [json.loads(line) for line in sample_file.open() if line.strip()]
+else:
+    rows = json.loads(sample_file.read_text())["logs"]
 assert len(rows) == expected, (len(rows), expected)
 assert len({row["doc_id"] for row in rows}) == expected, "Duplicated evaluation questions"
 def strings(value):
@@ -112,18 +116,18 @@ PY
 }
 
 evaluate() {
-    local tag=$1 gpu=$2 port=$3
+    local tag=$1 gpu=$2 port=$3 scope=${1%_v2}
     [ ! -e "$OUT_ROOT/$tag" ] || { echo "Refusing to mix evaluation logs; output already exists: $OUT_ROOT/$tag" >&2; return 2; }
     if [ "$tag" = base ]; then
         env -u VGGT_DIR -u VGGT_STATS -u LORA -u GATHER_SCOPE \
             HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
             bash scripts/vggt17/run_eval.sh "$gpu" "$port" "$tag" all
-    elif [ "$tag" = cam ]; then
+    elif [ "$scope" = cam ]; then
         env -u VGGT_DIR -u VGGT_STATS -u GATHER_SCOPE \
-            LORA="$RUN/cam" HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+            LORA="$RUN/$tag" HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
             bash scripts/vggt17/run_eval.sh "$gpu" "$port" "$tag" all
     else
-        env -u VGGT_STATS LORA="$RUN/$tag" VGGT_DIR="$EVAL_FEATURES" GATHER_SCOPE="$tag" \
+        env -u VGGT_STATS LORA="$RUN/$tag" VGGT_DIR="$EVAL_FEATURES" GATHER_SCOPE="$scope" \
             HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
             bash scripts/vggt17/run_eval.sh "$gpu" "$port" "$tag" all
     fi
@@ -175,15 +179,23 @@ PY
     train-cam) train_arm cam 0 none self ;;
     train-self) train_arm self 1 lookat self ;;
     train-all) train_arm all 1 lookat all ;;
+    train-cam-v2) LR=1e-5 train_arm cam_v2 0 none self ;;
+    train-self-v2) LR=1e-5 train_arm self_v2 1 lookat self ;;
+    train-all-v2) LR=1e-5 train_arm all_v2 1 lookat all ;;
     eval-base) evaluate base 0 29611 ;;
     eval-cam) evaluate cam 1 29612 ;;
     eval-self) evaluate self 0 29613 ;;
     eval-all) evaluate all 1 29614 ;;
+    eval-cam-v2) evaluate cam_v2 1 29622 ;;
+    eval-self-v2) evaluate self_v2 0 29623 ;;
+    eval-all-v2) evaluate all_v2 1 29624 ;;
     check-evals)
-        for tag in base cam self all; do check_eval "$tag"; done
+        shift
+        [ "$#" -gt 0 ] || set -- base cam self all
+        for tag; do check_eval "$tag"; done
         ;;
     *)
-        echo "Usage: bash scripts/vggt17/run_b200.sh {setup|models|subset|smoke-features|smoke|features|stats|train-cam|train-self|train-all|eval-base|eval-cam|eval-self|eval-all|check-evals}" >&2
+        echo "Usage: bash scripts/vggt17/run_b200.sh {setup|models|subset|smoke-features|smoke|features|stats|train-cam|train-self|train-all|train-cam-v2|train-self-v2|train-all-v2|eval-base|eval-cam|eval-self|eval-all|eval-cam-v2|eval-self-v2|eval-all-v2|check-evals [ARM ...]}" >&2
         exit 2
         ;;
 esac

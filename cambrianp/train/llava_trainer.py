@@ -684,7 +684,19 @@ class LLaVATrainer(Trainer):
             base_model._last_max_frame_interval = inputs.pop("batch_max_frame_interval", 0)
 
         return super().training_step(model, inputs)
-            
+
+    def _get_vggt_gather_logs(self):
+        logs = {}
+        for name, module in self.model.named_modules():
+            if "vggt_projector" not in name:
+                continue
+            stats = getattr(module, "last_gather_stats", None)
+            if stats is not None:
+                logs.update({f"vggt_{key}": float(value) for key, value in stats.items()})
+                logs["vggt_near_neighbors"] = float(stats["neighbors"] - stats["far_neighbors"])
+                module.last_gather_stats = None
+        return logs
+
     def _maybe_log_save_evaluate(self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval):
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
 
@@ -701,6 +713,7 @@ class LLaVATrainer(Trainer):
                 logs["grad_norm"] = grad_norm.detach().item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             if getattr(self, "_vggt_proj_grad_norm", None) is not None:
                 logs["vggt_proj_grad_norm"] = float(self._vggt_proj_grad_norm)
+            logs.update(self._get_vggt_gather_logs())
             logs["learning_rate"] = self._get_learning_rate()
             if torch.cuda.is_available():
                 logs["peak_mem_gb"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
